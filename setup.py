@@ -12,7 +12,7 @@ setup(
         "cx_oracle",
         "loguru",
     ],
-    description='CMR Connectors Library',
+    description='Deepkube Data Platform Global Library',
     author='Berexia DEV Team',
     author_email='berexiadev@berexia.com',
     long_description=open('README.md').read(),
