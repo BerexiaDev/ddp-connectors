@@ -4,4 +4,4 @@ venv
 .venv
 build
 dist
-cmr_connectors_lib.egg-info
+ddp_connectors_lib.egg-info

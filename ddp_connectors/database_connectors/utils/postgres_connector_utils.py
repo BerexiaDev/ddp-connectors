@@ -1,6 +1,6 @@
 import re
 from typing import List, Dict, Any
-from cmr_connectors_lib.database_connectors.utils.enums import SelectType, AggregationFunction, ColumnType, JoinType, ComparisonType, QueryOperator, DateUnit
+from ddp_connectors_lib.database_connectors.utils.enums import SelectType, AggregationFunction, ColumnType, JoinType, ComparisonType, QueryOperator, DateUnit
 import pandas as pd
 
 def _build_select_clause(selected_fields: List[Dict[str, Any]]) -> str:

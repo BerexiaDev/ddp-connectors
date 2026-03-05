@@ -9,9 +9,9 @@ from typing import Dict, Any, List, Tuple
 from pyodbc import Cursor
 
 from .sql_connector import SqlConnector
-from cmr_connectors_lib.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
+from ddp_connectors_lib.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
     _build_having_clause
-from cmr_connectors_lib.database_connectors.sql_connector_utils import cast_postgres_to_typescript
+from ddp_connectors_lib.database_connectors.sql_connector_utils import cast_postgres_to_typescript
 from .sql_connector_utils import safe_convert_to_string
 
 

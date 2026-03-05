@@ -126,7 +126,7 @@ Each connector requires a settings dictionary with connection parameters:
 ## Project Structure
 
 ```
-cmr_connectors_lib/
+ddp_connectors_lib/
     connectors_factory.py              # Factory for creating database connectors
     database_connectors/
         sql_connector.py               # Abstract base class (interface contract)
