@@ -1,6 +1,6 @@
-from ddp_connectors_lib.database_connectors.postgres_connector import PostgresConnector
-from ddp_connectors_lib.database_connectors.sql_server_connector import SqlServerConnector
-from ddp_connectors_lib.database_connectors.informix_connector import InformixConnector
+from ddp_connectors.database_connectors.postgres_connector import PostgresConnector
+from ddp_connectors.database_connectors.sql_server_connector import SqlServerConnector
+from ddp_connectors.database_connectors.informix_connector import InformixConnector
 
 
 class ConnectorFactory():
