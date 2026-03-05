@@ -1,4 +1,4 @@
-# CMR Connectors Library
+# Connectors Library
 
 A unified Python database abstraction layer that provides a consistent interface for connecting to, extracting from, and managing multiple database systems. Built for ETL/ELT pipelines, data migrations, and cross-database operations.
 
