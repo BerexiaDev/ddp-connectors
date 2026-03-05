@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='cmr_connectors_lib',
+    name='ddp_connectors_lib',
     version='0.10.0',
     packages=find_packages(),
     # Add dependencies here
