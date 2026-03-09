@@ -326,58 +326,84 @@ def cast_oracle_to_typescript(oracle_type: str) -> str:
     if not oracle_type:
         return "any"
 
-    raw_type = oracle_type.lower().strip()
+    oracle_type_normalized = " ".join(oracle_type.lower().strip().split())
 
-    # Strip out any modifiers in parentheses (e.g., "(255)", "(10, 2)", "(6)") (timestamp(6) => timestamp)
-    base_type = re.sub(r'\s*\([^)]*\)', '', raw_type).strip()
-
-    mapping: Dict[str, str] = {
-        # Numeric Types -> TS number
+    oracle_to_ts: Dict[str, str] = {
+        # --- Numbers ---
         "number": "number",
-        "float": "number",
-        "binary_float": "number",
-        "binary_double": "number",
+        "numeric": "number",
+        "dec": "number",
+        "decimal": "number",
         "int": "number",
         "integer": "number",
         "smallint": "number",
-        "decimal": "number",
-        "dec": "number",
-        "numeric": "number",
+        "float": "number",
+        "real": "number",
+        "double precision": "number",
+        "binary_float": "number",
+        "binary_double": "number",
 
-        # Character / String Types -> TS string
+        # --- Strings & Characters ---
+        "char": "string",
+        "character": "string",
+        "nchar": "string",
+        "national char": "string",
+        "national character": "string",
+        "varchar": "string",
         "varchar2": "string",
         "nvarchar2": "string",
-        "varchar": "string",
-        "char": "string",
-        "nchar": "string",
+        "character varying": "string",
+        "char varying": "string",
+        "national character varying": "string",
+        "national char varying": "string",
         "clob": "string",
         "nclob": "string",
         "long": "string",
         "rowid": "string",
         "urowid": "string",
-
-        # Date & Time Types -> TS Date
-        "date": "Date",
-        "timestamp": "Date",
-        "timestamp with time zone": "Date",
-        "timestamp with local time zone": "Date",
-        "interval year to month": "string", # Intervals are usually parsed as strings formatted as ISO durations
+        "xmltype": "string",
+        "bfile": "string",
+        "sdo_geometry": "string", 
+        "uritype": "string",
+        "httpuritype": "string",
+        "xdburitype": "string",
+        "dburitype": "string",
+        "ref": "string",
+        "interval year to month": "string", # Intervals are usually parsed as ISO strings in JS
         "interval day to second": "string",
 
-        # Binary / BLOB Types -> TS Uint8Array (Standard for binary data in JS/TS)
-        "blob": "List",
-        "raw": "List",
-        "long raw": "List",
-        "bfile": "List",
+        # --- Dates & Times ---
+        "date": "Date",
+        "timestamp": "Datetime",
+        "timestamp with time zone": "Datetime",
+        "timestamp with local time zone": "Datetime",
 
-        # Misc Types
-        "xmltype": "string",
-        "json": "any",      # Can also be Record<string, any> depending on your TS strictness
-        "boolean": "boolean" # Oracle 23c introduced native BOOLEAN
+        # --- Booleans ---
+        "boolean": "boolean",
+        "bool": "boolean",
+
+        # --- Objects & Records ---
+        "json": "record",
+        "object": "record",
+
+        # --- Lists & Arrays ---
+        "vector": "list",
+        "varray": "list",
+        "nested table": "list",
+
+        # --- Binaries & Unknowns ---
+        # BLOB/RAW usually come through the API as base64 strings or ArrayBuffers, 
+        # but 'any' is the safest fallback for the frontend if you don't have a specific BLOB enum.
+        "raw": "any",
+        "long raw": "any",
+        "blob": "any",
+        "anydata": "any",
+        "anytype": "any",
+        "anydataset": "any",
     }
 
-    # 4. Return the mapped type, falling back to "any" if unknown
-    return mapping.get(base_type, "any")
+    # Default to 'any' if the type is completely unrecognized
+    return oracle_to_ts.get(oracle_type_normalized, "any")
 
 def cast_sqlserver_to_postgresql_type(sql_server_type: str) -> str:
     """
@@ -449,54 +475,88 @@ def cast_oracle_to_postgresql_type(oracle_type: str) -> str:
     :return: The corresponding PostgreSQL data type
     """
     # Normalize the input to lowercase to ensure matching works regardless of input casing
-    oracle_type_normalized = oracle_type.lower().strip()
+    oracle_type_normalized = " ".join(oracle_type.lower().strip().split())
 
     oracle_to_pg: Dict[str, str] = {
-
-        # Numerics
         "number": "NUMERIC",
+        "numeric": "NUMERIC",
+        "dec": "NUMERIC",
+        "decimal": "NUMERIC",
+
         "int": "INTEGER",
         "integer": "INTEGER",
         "smallint": "SMALLINT",
+
         "float": "DOUBLE PRECISION",
+        "real": "REAL",
+        "double precision": "DOUBLE PRECISION",
+
         "binary_float": "REAL",
         "binary_double": "DOUBLE PRECISION",
-        "dec": "NUMERIC",
-        "decimal": "NUMERIC",
-        "double precision": "DOUBLE PRECISION",
-        "real": "REAL",
 
-        # Character / Text
         "char": "CHAR",
+        "character": "CHAR",
+
         "nchar": "CHAR",
-        "varchar2": "VARCHAR",
-        "nvarchar2": "VARCHAR",
+        "national char": "CHAR",
+        "national character": "CHAR",
+
         "varchar": "VARCHAR",
+        "varchar2": "VARCHAR",
+
+        "nvarchar2": "VARCHAR",
+        "character varying": "VARCHAR",
+        "char varying": "VARCHAR",
+        "national character varying": "VARCHAR",
+        "national char varying": "VARCHAR",
+
         "clob": "TEXT",
         "nclob": "TEXT",
         "long": "TEXT",
 
-        # Binary / BLOB
-        "blob": "BYTEA",
+
         "raw": "BYTEA",
         "long raw": "BYTEA",
-        "bfile": "TEXT",  # BFILE stores a locator to a physical file; TEXT or VARCHAR is standard
+        "blob": "BYTEA",
 
-        # Date & Time
-        # Oracle's DATE includes time, so TIMESTAMP is the safest equivalent to prevent data loss
-        "date": "TIMESTAMP", 
+        "bfile": "TEXT",
+
+        "date": "TIMESTAMP",
+
         "timestamp": "TIMESTAMP",
         "timestamp with time zone": "TIMESTAMPTZ",
         "timestamp with local time zone": "TIMESTAMPTZ",
+
         "interval year to month": "INTERVAL",
         "interval day to second": "INTERVAL",
 
-        # Misc
-        "xmltype": "XML",
-        "rowid": "TEXT",  # Typically mapped to text or varchar in PG
+        "rowid": "TEXT",
         "urowid": "TEXT",
+
+
+        "xmltype": "XML",
+
         "json": "JSONB",
+
+        "boolean": "BOOLEAN",
+        "bool": "BOOLEAN",
+
+        "vector": "VECTOR",
+
+        "ref": "TEXT",
+        "object": "JSONB",
+        "varray": "JSONB",
+        "nested table": "JSONB",
+
+        "sdo_geometry": "TEXT", 
+        "uritype": "TEXT",
+        "httpuritype": "TEXT",
+        "xdburitype": "TEXT",
+        "dburitype": "TEXT",
+
+        "anydata": "JSONB",
+        "anytype": "JSONB",
+        "anydataset": "JSONB",
     }
 
-    # Default to TEXT if the type is not found
     return oracle_to_pg.get(oracle_type_normalized, "TEXT")

@@ -8,6 +8,7 @@ from datetime import datetime
 from loguru import logger
 from typing import Dict, Any, List, Tuple
 from .sql_connector import SqlConnector
+from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
 
 from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
 
@@ -17,35 +18,58 @@ class OracleConnector(SqlConnector):
     def __init__(self, host, user, password, port, database, schema):
         super().__init__(host, user, password, port, database)
         self.driver = "oracledb"
-        self.schema = schema.upper() # Oracle schemas are typically uppercase
+        self.schema = schema.upper() if schema else user.upper() # Oracle schemas are typically uppercase
 
     
     def ping(self) -> bool:
-        """Test the Oracle database connection using the DUAL table."""
-        conn = None
+        """
+        Tests the database connection and verifies the target schema exists.
+        Returns True if successful, raises an Exception or returns False if not.
+        """
         try:
+            # 1. This tests if the Host, Port, Database, User, and Password are correct.
+            # If get_connection() fails, it throws an exception immediately.
             conn = self.get_connection()
+            
             with conn.cursor() as cursor:
-                # Oracle requires FROM DUAL for simple selects
-                cursor.execute("SELECT 1 FROM DUAL") 
-                cursor.fetchone()
+                # 2. Basic sanity check (Ping)
+                cursor.execute("SELECT 1 FROM DUAL")
+                
+                cursor.execute(
+                    "SELECT count(*) FROM all_users WHERE username = :schema_name",
+                    schema_name=self.schema
+                )
+                
+                schema_count = cursor.fetchone()[0]
+                
+                if schema_count == 0:
+                    logger.error(f"Ping failed: Schema '{self.schema}' does not exist.")
+                    return False
+                    
+            logger.info(f"Successfully pinged Oracle database and verified schema: {self.schema}")
             return True
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
+            
+        except Exception as exc:
+            logger.error(f"Oracle connection ping failed: {exc}")
             return False
+            
         finally:
-            if conn:
-                conn.close()
+            conn.close()
     
     def get_connection(self):
-        # Using thin mode (default in oracledb). 
-        # 'database' is typically the Oracle Service Name (SID/Service)
+        # automatically fetch CLOBs/BLOBs as strings/bytes
+        oracledb.defaults.fetch_lobs = False
         dsn = f"{self.host}:{self.port}/{self.database}"
-        return oracledb.connect(
+        conn = oracledb.connect(
             user=self.user,
             password=self.password,
             dsn=dsn
         )
+
+        # 3. Attach our custom handler for BFILEs (and other edge cases)
+        conn.outputtypehandler = self._oracle_type_handler
+        
+        return conn
 
     def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
         """Parse filters payload into a safe WHERE clause and parameters for Oracle."""
@@ -166,18 +190,39 @@ class OracleConnector(SqlConnector):
 
     def fetch_batch(self, cursor, table_name, offset: int, limit: int = 100):
         try:
+            oracledb.defaults.fetch_lobs = False
             query = f'SELECT * FROM {self.schema}.\"{table_name}\" OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY'
             cursor.execute(query)
             return cursor.fetchall()
         except Exception as e:
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
             return []
+    
+    def _oracle_type_handler(self, cursor, name, default_type, size, precision, scale):
+        """
+        Intercepts specific Oracle data types during fetch and converts them.
+        oracledb automatically passes these 6 arguments for every column.
+        """
+        # Intercept BFILE types using 'default_type'
+        if default_type == oracledb.DB_TYPE_BFILE:
+            
+            # Define how to convert the BFILE to a string
+            def bfile_out_converter(bfile_obj):
+                if bfile_obj and hasattr(bfile_obj, 'getfilename'):
+                    dir_alias, filename = bfile_obj.getfilename()
+                    return f"{dir_alias}/{filename}"
+                return None
+                
+            # Tell the cursor to use this converter for this column
+            return cursor.var(
+                default_type, 
+                arraysize=cursor.arraysize, 
+                outconverter=bfile_out_converter
+            )
 
     def stream_batch(self, table_name: str, batch_size: int = 10_000):
         """Streaming for Oracle using fetchmany. Oracle driver handles arraysize natively."""
         conn = self.get_connection()
-        logger.debug(f"stream_batch ==> {table_name}")
-        logger.debug(f"self.schema ==> {self.schema}")
         try:
             with conn.cursor() as cursor:
                 cursor.arraysize = batch_size

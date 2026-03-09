@@ -34,5 +34,5 @@ class ConnectorFactory():
         elif connector_type == 'oracle':
             connector = OracleConnector(connector_settings["host"], connector_settings["user"],
                                           connector_settings["password"], connector_settings["port"],
-                                          connector_settings["database"], connector_settings.get("schema", 'ddp_user'))
+                                          connector_settings["database"], connector_settings.get("schema"))
             return connector
