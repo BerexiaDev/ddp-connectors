@@ -7,16 +7,9 @@ from datetime import datetime
 
 from loguru import logger
 from typing import Dict, Any, List, Tuple
-from pyodbc import Cursor
-
 from .sql_connector import SqlConnector
-from ddp_connectors.database_connectors.utils.postgres_connector_utils import (
-    _build_select_clause, _build_joins_clause, _build_where_clause, 
-    _build_group_by, _build_having_clause
-)
-# Note: You may need an Oracle-specific typescript caster
-from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript 
-from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, cast_sqlserver_to_typescript_types, safe_convert_to_string
+
+from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
 
 
 class OracleConnector(SqlConnector):
