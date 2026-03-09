@@ -1,3 +1,4 @@
+import re
 from typing import Dict
 
 import sqlalchemy
@@ -207,6 +208,7 @@ def cast_postgres_to_typescript(data_type: str) -> str:
     Simple mapping from Postgres data_type/udt_name to a TS type.
     Extend this as needed.
     """
+    data_type = data_type.lower().strip()
     mapping: Dict[str, str] = {
         # numeric types
         "smallint": "number",
@@ -262,6 +264,8 @@ def cast_sqlserver_to_typescript_types(sql_type: str) -> str:
        Unknown or unlisted SQL types fall back to `'any'`.
     """
 
+    sql_type = sql_type.lower().strip()
+
     sql_server_to_ts: Dict[str, str] = {
         # numeric
         "int": "number",
@@ -313,6 +317,67 @@ def cast_sqlserver_to_typescript_types(sql_type: str) -> str:
 
     return sql_server_to_ts.get(sql_type, "any")
 
+
+def cast_oracle_to_typescript(oracle_type: str) -> str:
+    """
+    Maps an Oracle data type to a corresponding TypeScript type.
+    Handles precision/scale modifiers and complex timestamp declarations.
+    """
+    if not oracle_type:
+        return "any"
+
+    raw_type = oracle_type.lower().strip()
+
+    # Strip out any modifiers in parentheses (e.g., "(255)", "(10, 2)", "(6)") (timestamp(6) => timestamp)
+    base_type = re.sub(r'\s*\([^)]*\)', '', raw_type).strip()
+
+    mapping: Dict[str, str] = {
+        # Numeric Types -> TS number
+        "number": "number",
+        "float": "number",
+        "binary_float": "number",
+        "binary_double": "number",
+        "int": "number",
+        "integer": "number",
+        "smallint": "number",
+        "decimal": "number",
+        "dec": "number",
+        "numeric": "number",
+
+        # Character / String Types -> TS string
+        "varchar2": "string",
+        "nvarchar2": "string",
+        "varchar": "string",
+        "char": "string",
+        "nchar": "string",
+        "clob": "string",
+        "nclob": "string",
+        "long": "string",
+        "rowid": "string",
+        "urowid": "string",
+
+        # Date & Time Types -> TS Date
+        "date": "Date",
+        "timestamp": "Date",
+        "timestamp with time zone": "Date",
+        "timestamp with local time zone": "Date",
+        "interval year to month": "string", # Intervals are usually parsed as strings formatted as ISO durations
+        "interval day to second": "string",
+
+        # Binary / BLOB Types -> TS Uint8Array (Standard for binary data in JS/TS)
+        "blob": "List",
+        "raw": "List",
+        "long raw": "List",
+        "bfile": "List",
+
+        # Misc Types
+        "xmltype": "string",
+        "json": "any",      # Can also be Record<string, any> depending on your TS strictness
+        "boolean": "boolean" # Oracle 23c introduced native BOOLEAN
+    }
+
+    # 4. Return the mapped type, falling back to "any" if unknown
+    return mapping.get(base_type, "any")
 
 def cast_sqlserver_to_postgresql_type(sql_server_type: str) -> str:
     """
@@ -375,3 +440,63 @@ def cast_sqlserver_to_postgresql_type(sql_server_type: str) -> str:
     }
 
     return sql_server_to_pg.get(sql_server_type, "TEXT")
+
+
+def cast_oracle_to_postgresql_type(oracle_type: str) -> str:
+    """
+    Map Oracle type to Postgres type.
+    :param oracle_type: The Oracle data type as a string
+    :return: The corresponding PostgreSQL data type
+    """
+    # Normalize the input to lowercase to ensure matching works regardless of input casing
+    oracle_type_normalized = oracle_type.lower().strip()
+
+    oracle_to_pg: Dict[str, str] = {
+
+        # Numerics
+        "number": "NUMERIC",
+        "int": "INTEGER",
+        "integer": "INTEGER",
+        "smallint": "SMALLINT",
+        "float": "DOUBLE PRECISION",
+        "binary_float": "REAL",
+        "binary_double": "DOUBLE PRECISION",
+        "dec": "NUMERIC",
+        "decimal": "NUMERIC",
+        "double precision": "DOUBLE PRECISION",
+        "real": "REAL",
+
+        # Character / Text
+        "char": "CHAR",
+        "nchar": "CHAR",
+        "varchar2": "VARCHAR",
+        "nvarchar2": "VARCHAR",
+        "varchar": "VARCHAR",
+        "clob": "TEXT",
+        "nclob": "TEXT",
+        "long": "TEXT",
+
+        # Binary / BLOB
+        "blob": "BYTEA",
+        "raw": "BYTEA",
+        "long raw": "BYTEA",
+        "bfile": "TEXT",  # BFILE stores a locator to a physical file; TEXT or VARCHAR is standard
+
+        # Date & Time
+        # Oracle's DATE includes time, so TIMESTAMP is the safest equivalent to prevent data loss
+        "date": "TIMESTAMP", 
+        "timestamp": "TIMESTAMP",
+        "timestamp with time zone": "TIMESTAMPTZ",
+        "timestamp with local time zone": "TIMESTAMPTZ",
+        "interval year to month": "INTERVAL",
+        "interval day to second": "INTERVAL",
+
+        # Misc
+        "xmltype": "XML",
+        "rowid": "TEXT",  # Typically mapped to text or varchar in PG
+        "urowid": "TEXT",
+        "json": "JSONB",
+    }
+
+    # Default to TEXT if the type is not found
+    return oracle_to_pg.get(oracle_type_normalized, "TEXT")

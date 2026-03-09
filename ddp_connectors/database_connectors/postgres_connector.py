@@ -546,28 +546,28 @@ class PostgresConnector(SqlConnector):
 
 
     
-    def  build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns = []):
+    def build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns=None):
         """
         Generates a PostgreSQL CREATE TABLE statement along with a CREATE INDEX statement
         (for indexed columns) using the provided column metadata.
         """
+        if columns is None:
+            columns = []
+            
         column_defs = []
         primary_keys = []
         index_keys = []
-        # matches func_name(…)  or   schema.func_name(…)
-        fun_call = re.compile(r'^[A-Za-z_][\w\.]*\s*\(.*\)$')
         for col in columns:
             col_name = col["name"]
-            col_type = col["type"].upper()
+            col_type = col["type"]
             length = col.get("length")
             nullable = col["nullable"].strip() == "YES"
-            default = col["default"] or ""
             is_pk = col["primary_key"].strip() == "YES"
             if col['is_index'] == "YES":
                 index_keys.append(col_name)
 
-            # Handle types with length
-            if col_type in ("VARCHAR", "CHAR") and length:
+            # Only append length if it's a string type that doesn't already have it
+            if col_type.upper() in ("VARCHAR", "CHAR") and length and "(" not in col_type:
                 col_type_str = f"{col_type}({length})"
             else:
                 col_type_str = col_type
@@ -578,19 +578,10 @@ class PostgresConnector(SqlConnector):
             if not nullable:
                 col_def_parts.append("NOT NULL")
 
-                # DEFAULT handling
-            if default:
-                d = default
-                # is this a function call?  (unquoted identifier + '(')
-                if not fun_call.match(d):
-                    # it’s either a literal ('…'), numeric (1234), casted literal ('…'::text), etc.
-                    col_def_parts.append(f"DEFAULT {d}")
-                # else: skip it
-
             column_defs.append(" ".join(col_def_parts))
 
-            # if is_pk:
-            #     primary_keys.append(f'"{col_name}"')
+            if is_pk:
+                primary_keys.append(f'"{col_name}"')
 
         # Append primary key constraint
         if primary_keys:
@@ -611,7 +602,6 @@ class PostgresConnector(SqlConnector):
             index_stmt = ";\n".join(index_statements) + ";"
 
         return create_stmt, index_stmt
-
 
     def get_view_columns(self, table_name: str, schema_name: str = 'populations'):
         """
