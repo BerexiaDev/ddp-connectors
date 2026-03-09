@@ -71,123 +71,6 @@ class OracleConnector(SqlConnector):
         
         return conn
 
-    def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
-        """Parse filters payload into a safe WHERE clause and parameters for Oracle."""
-        parsed_filters = []
-        if isinstance(filters, str):
-            filters_str = filters.strip()
-            if filters_str:
-                try:
-                    parsed_filters = json.loads(filters_str)
-                    if not isinstance(parsed_filters, list):
-                        logger.error("Filters must be a JSON array; ignoring filters.")
-                        parsed_filters = []
-                except json.JSONDecodeError as exc:
-                    logger.error(f"Invalid filters JSON provided; ignoring filters. {exc}")
-            else:
-                logger.warning("Empty filters string provided; ignoring filters.")
-        elif isinstance(filters, list):
-            parsed_filters = filters
-        elif filters is not None:
-            logger.error("Filters must be a JSON string or list; ignoring filters.")
-
-        clauses: List[str] = []
-        params: List[Any] = []
-        param_idx = 1 # Oracle uses :1, :2, etc.
-
-        if parsed_filters:
-            op_map = {
-                "CONTAINS": ("LIKE", lambda v: f"%{v}%"),
-                "NOT_CONTAINS": ("NOT LIKE", lambda v: f"%{v}%"),
-                "STARTS_WITH": ("LIKE", lambda v: f"{v}%"),
-                "ENDS_WITH": ("LIKE", lambda v: f"%{v}"),
-                # Oracle Regex
-                "MATCHES": ("REGEXP_LIKE", None), 
-                "NOT_MATCHES": ("NOT REGEXP_LIKE", None),
-                "=": "=", "!=": "!=", ">": ">", "<": "<", ">=": ">=", "<=": "<=",
-                "EQUALS": "=", "NOT_EQUALS": "!=", "GREATER_THAN": ">", 
-                "LESS_THAN": "<", "GREATER_THAN_OR_EQUAL": ">=", "LESS_THAN_OR_EQUAL": "<=",
-                "BETWEEN": "BETWEEN", "NOT_BETWEEN": "NOT BETWEEN",
-                "IN": "IN", "NOT_IN": "NOT IN",
-                "IS_NULL": "IS NULL", "IS_NOT_NULL": "IS NOT NULL",
-            }
-
-            for condition in parsed_filters:
-                col_info = condition.get("column") or {}
-                col_name = col_info.get("name")
-                if not col_name or not isinstance(col_name, str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name):
-                    continue
-
-                raw_operator = condition.get("operator")
-                op_key = str(raw_operator).strip().upper().replace(" ", "_") if raw_operator else None
-                sql_op = op_map.get(op_key) if op_key else None
-                if not sql_op:
-                    continue
-
-                value = condition.get("value")
-                value_to = condition.get("valueTo")
-
-                if op_key in ("BETWEEN", "NOT_BETWEEN"):
-                    if value is None or value_to is None: continue
-                    clauses.append(f"\"{col_name}\" {sql_op} :{param_idx} AND :{param_idx+1}")
-                    params.extend([value, value_to])
-                    param_idx += 2
-                elif op_key in ("IN", "NOT_IN"):
-                    values = value if isinstance(value, list) else [v.strip() for v in str(value).split(",") if v.strip()]
-                    if not values: continue
-                    placeholders = ", ".join([f":{param_idx + i}" for i in range(len(values))])
-                    clauses.append(f"\"{col_name}\" {sql_op} ({placeholders})")
-                    params.extend(values)
-                    param_idx += len(values)
-                elif op_key in ("IS_NULL", "IS_NOT_NULL"):
-                    clauses.append(f"\"{col_name}\" {sql_op}")
-                elif op_key in ("MATCHES", "NOT_MATCHES"):
-                    if value is None: continue
-                    op_str, _ = sql_op
-                    prefix = "NOT " if "NOT" in op_str else ""
-                    clauses.append(f"{prefix}REGEXP_LIKE(\"{col_name}\", :{param_idx})")
-                    params.append(value)
-                    param_idx += 1
-                elif isinstance(sql_op, tuple):
-                    sql_operator, pattern_builder = sql_op
-                    if value is None: continue
-                    clauses.append(f"\"{col_name}\" {sql_operator} :{param_idx}")
-                    params.append(pattern_builder(value))
-                    param_idx += 1
-                else:
-                    if value is None: continue
-                    clauses.append(f"\"{col_name}\" {sql_op} :{param_idx}")
-                    params.append(value)
-                    param_idx += 1
-
-        where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        return where_clause, params
-
-    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None) -> List[Dict[str, Any]]:
-        where_clause, params = self._build_filters_clause(filters)
-        # Oracle 12c+ Pagination
-        query = (
-            f"SELECT * FROM {self.schema}.\"{table_name}\" "
-            f"{where_clause} "
-            f"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
-        )
-        logger.info(f"Fetching batch: table={table_name}, offset={offset}, limit={limit}")
-        
-        conn = self.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute(query, params)
-                cols = [c[0] for c in cursor.description]
-                return [
-                    {col: safe_convert_to_string(row[idx]) for idx, col in enumerate(cols)}
-                    for row in cursor.fetchall()
-                ]
-        except Exception as exc:
-            logger.error(f"Error extracting batch from {table_name}: {exc}")
-            return []
-        finally:
-            conn.close()
-
     def fetch_batch(self, cursor, table_name, offset: int, limit: int = 100):
         try:
             oracledb.defaults.fetch_lobs = False
@@ -280,8 +163,6 @@ class OracleConnector(SqlConnector):
                 for column_name, data_type in rows:
                     ts_type = cast_oracle_to_typescript(data_type)
                     columns.append({"name": column_name, "type": ts_type, "alias": column_name})
-                
-                logger.debug(f"Columns: {columns}")
                 return columns
         except Exception as e:
             logger.error(f"Error getting columns: {e}")
@@ -289,14 +170,13 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def count_table_rows(self, table_name: str, filters=None) -> int:
-        where_clause, params = self._build_filters_clause(filters)
+    def count_table_rows(self, table_name: str) -> int:
         conn = self.get_connection()
         try:
             with conn.cursor() as cursor:
                 # Add .upper() to the table name
-                sql = f"SELECT COUNT(*) FROM {self.schema}.\"{table_name.upper()}\" {where_clause}"
-                cursor.execute(sql, params)
+                sql = f"SELECT COUNT(*) FROM {self.schema}.\"{table_name.upper()}\""
+                cursor.execute(sql)
                 count_result = cursor.fetchone()
                 return int(count_result[0]) if count_result else 0
         except Exception as e:
@@ -411,42 +291,6 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def create_table_if_missing(self, table_name:str, create_table_statement: str, index_table_statement:str = None):
-        """Creates a table in Oracle via PL/SQL to emulate IF NOT EXISTS."""
-        conn = self.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                # ORA-00955: name is already used by an existing object
-                plsql_create = f"""
-                BEGIN
-                   EXECUTE IMMEDIATE '{create_table_statement.replace("'", "''")}';
-                EXCEPTION
-                   WHEN OTHERS THEN
-                      IF SQLCODE != -955 THEN RAISE; END IF;
-                END;
-                """
-                cursor.execute(plsql_create)
-                
-                if index_table_statement:
-                    for idx_stmt in index_table_statement.split(';'):
-                        if idx_stmt.strip():
-                            plsql_idx = f"""
-                            BEGIN
-                               EXECUTE IMMEDIATE '{idx_stmt.strip().replace("'", "''")}';
-                            EXCEPTION
-                               WHEN OTHERS THEN
-                                  IF SQLCODE != -955 THEN RAISE; END IF;
-                            END;
-                            """
-                            cursor.execute(plsql_idx)
-                conn.commit()
-                logger.info(f"Table {table_name} created or already exists.")
-        except Exception as e:
-            logger.error(f"Failed to create table {table_name}: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
-
     def fetch_deltas(self, cursor, primary_key: str, log_table: str, since_ts: datetime, batch_size: int = 10_000):
         # Replaced Postgres DISTINCT ON with ROW_NUMBER window function
         sql = f"""
@@ -474,24 +318,7 @@ class OracleConnector(SqlConnector):
                 yield row_dict
 
             offset += batch_size
-
-    def truncate_table(self, table_name: str, schema: str = None) -> bool:
-        conn = self.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                use_schema = schema if schema else self.schema
-                truncate_sql = f'TRUNCATE TABLE {use_schema}."{table_name}"'
-                cursor.execute(truncate_sql)
-                conn.commit()
-                return True
-        except Exception as e:
-            logger.error(f"Failed to truncate table {table_name}: {e}")
-            return False
-        finally:
-            conn.close()
             
-    # --- Truncated unchanged generic build_query logic for brevity, it remains standard SQL ---
-
 
     def get_table_indexes(self, table_name: str) -> list:
         """Returns a list of indexes for the given table."""
