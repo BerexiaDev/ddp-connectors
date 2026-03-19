@@ -1,3 +1,4 @@
+import re
 from typing import Dict
 
 import sqlalchemy
@@ -207,6 +208,7 @@ def cast_postgres_to_typescript(data_type: str) -> str:
     Simple mapping from Postgres data_type/udt_name to a TS type.
     Extend this as needed.
     """
+    data_type = data_type.lower().strip()
     mapping: Dict[str, str] = {
         # numeric types
         "smallint": "number",
@@ -262,6 +264,8 @@ def cast_sqlserver_to_typescript_types(sql_type: str) -> str:
        Unknown or unlisted SQL types fall back to `'any'`.
     """
 
+    sql_type = sql_type.lower().strip()
+
     sql_server_to_ts: Dict[str, str] = {
         # numeric
         "int": "number",
@@ -313,6 +317,93 @@ def cast_sqlserver_to_typescript_types(sql_type: str) -> str:
 
     return sql_server_to_ts.get(sql_type, "any")
 
+
+def cast_oracle_to_typescript(oracle_type: str) -> str:
+    """
+    Maps an Oracle data type to a corresponding TypeScript type.
+    Handles precision/scale modifiers and complex timestamp declarations.
+    """
+    if not oracle_type:
+        return "any"
+
+    oracle_type_normalized = " ".join(oracle_type.lower().strip().split())
+
+    oracle_to_ts: Dict[str, str] = {
+        # --- Numbers ---
+        "number": "number",
+        "numeric": "number",
+        "dec": "number",
+        "decimal": "number",
+        "int": "number",
+        "integer": "number",
+        "smallint": "number",
+        "float": "number",
+        "real": "number",
+        "double precision": "number",
+        "binary_float": "number",
+        "binary_double": "number",
+
+        # --- Strings & Characters ---
+        "char": "string",
+        "character": "string",
+        "nchar": "string",
+        "national char": "string",
+        "national character": "string",
+        "varchar": "string",
+        "varchar2": "string",
+        "nvarchar2": "string",
+        "character varying": "string",
+        "char varying": "string",
+        "national character varying": "string",
+        "national char varying": "string",
+        "clob": "string",
+        "nclob": "string",
+        "long": "string",
+        "rowid": "string",
+        "urowid": "string",
+        "xmltype": "string",
+        "bfile": "string",
+        "sdo_geometry": "string", 
+        "uritype": "string",
+        "httpuritype": "string",
+        "xdburitype": "string",
+        "dburitype": "string",
+        "ref": "string",
+        "interval year to month": "string", # Intervals are usually parsed as ISO strings in JS
+        "interval day to second": "string",
+
+        # --- Dates & Times ---
+        "date": "Date",
+        "timestamp": "Datetime",
+        "timestamp with time zone": "Datetime",
+        "timestamp with local time zone": "Datetime",
+
+        # --- Booleans ---
+        "boolean": "boolean",
+        "bool": "boolean",
+
+        # --- Objects & Records ---
+        "json": "record",
+        "object": "record",
+
+        # --- Lists & Arrays ---
+        "vector": "list",
+        "varray": "list",
+        "nested table": "list",
+
+        # --- Binaries & Unknowns ---
+        # BLOB/RAW usually come through the API as base64 strings or ArrayBuffers, 
+        # but 'any' is the safest fallback for the frontend if you don't have a specific BLOB enum.
+        "raw": "any",
+        "long raw": "any",
+        "blob": "any",
+        "anydata": "any",
+        "anytype": "any",
+        "anydataset": "any",
+    }
+
+    # Default to 'any' if the type is completely unrecognized
+    return oracle_to_ts.get(oracle_type_normalized, "any")
 
 def cast_sqlserver_to_postgresql_type(sql_server_type: str) -> str:
     """
@@ -375,3 +466,97 @@ def cast_sqlserver_to_postgresql_type(sql_server_type: str) -> str:
     }
 
     return sql_server_to_pg.get(sql_server_type, "TEXT")
+
+
+def cast_oracle_to_postgresql_type(oracle_type: str) -> str:
+    """
+    Map Oracle type to Postgres type.
+    :param oracle_type: The Oracle data type as a string
+    :return: The corresponding PostgreSQL data type
+    """
+    # Normalize the input to lowercase to ensure matching works regardless of input casing
+    oracle_type_normalized = " ".join(oracle_type.lower().strip().split())
+
+    oracle_to_pg: Dict[str, str] = {
+        "number": "NUMERIC",
+        "numeric": "NUMERIC",
+        "dec": "NUMERIC",
+        "decimal": "NUMERIC",
+
+        "int": "INTEGER",
+        "integer": "INTEGER",
+        "smallint": "SMALLINT",
+
+        "float": "DOUBLE PRECISION",
+        "real": "REAL",
+        "double precision": "DOUBLE PRECISION",
+
+        "binary_float": "REAL",
+        "binary_double": "DOUBLE PRECISION",
+
+        "char": "CHAR",
+        "character": "CHAR",
+
+        "nchar": "CHAR",
+        "national char": "CHAR",
+        "national character": "CHAR",
+
+        "varchar": "VARCHAR",
+        "varchar2": "VARCHAR",
+
+        "nvarchar2": "VARCHAR",
+        "character varying": "VARCHAR",
+        "char varying": "VARCHAR",
+        "national character varying": "VARCHAR",
+        "national char varying": "VARCHAR",
+
+        "clob": "TEXT",
+        "nclob": "TEXT",
+        "long": "TEXT",
+
+
+        "raw": "BYTEA",
+        "long raw": "BYTEA",
+        "blob": "BYTEA",
+
+        "bfile": "TEXT",
+
+        "date": "TIMESTAMP",
+
+        "timestamp": "TIMESTAMP",
+        "timestamp with time zone": "TIMESTAMPTZ",
+        "timestamp with local time zone": "TIMESTAMPTZ",
+
+        "interval year to month": "INTERVAL",
+        "interval day to second": "INTERVAL",
+
+        "rowid": "TEXT",
+        "urowid": "TEXT",
+
+
+        "xmltype": "XML",
+
+        "json": "JSONB",
+
+        "boolean": "BOOLEAN",
+        "bool": "BOOLEAN",
+
+        "vector": "VECTOR",
+
+        "ref": "TEXT",
+        "object": "JSONB",
+        "varray": "JSONB",
+        "nested table": "JSONB",
+
+        "sdo_geometry": "TEXT", 
+        "uritype": "TEXT",
+        "httpuritype": "TEXT",
+        "xdburitype": "TEXT",
+        "dburitype": "TEXT",
+
+        "anydata": "JSONB",
+        "anytype": "JSONB",
+        "anydataset": "JSONB",
+    }
+
+    return oracle_to_pg.get(oracle_type_normalized, "TEXT")
