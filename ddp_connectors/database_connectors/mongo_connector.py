@@ -159,23 +159,22 @@ class MongoConnector:
         """
         MongoDB is schema-less. This infers 'columns' (keys) by sampling the first document.
         """
-        client = self.get_connection()
         try:
-            db = client[self.database_name]
-            sample_doc = db[table_name].find_one()
-            columns = []
-            
-            if sample_doc:
-                for key, value in sample_doc.items():
-                    # Simplistic type mapping based on Python types
-                    ts_type = type(value).__name__ 
-                    columns.append({"name": key, "type": ts_type, "alias": key})
-            return columns
+            return [
+                {
+                    "name": "id",
+                    "type": "string",
+                    "alias": "id",
+                },
+                {
+                    "name": "data",
+                    "type": "record",
+                    "alias": "data",
+                },
+            ]
         except Exception as e:
             logger.error(f"Error getting columns: {e}")
             return []
-        finally:
-            client.close()
 
     def count_table_rows(self, table_name: str) -> int:
         client = self.get_connection()
@@ -236,7 +235,7 @@ class MongoConnector:
                 "default": None, 
                 "primary_key": "NO", 
                 "foreign_key": "NO", 
-                "is_index": "YES",
+                "is_index": "NO",
             },
         ]
 
