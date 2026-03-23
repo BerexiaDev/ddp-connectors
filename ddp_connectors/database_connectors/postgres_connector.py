@@ -86,12 +86,44 @@ class PostgresConnector(SqlConnector):
                 "IS_NOT_NULL": "IS NOT NULL",
             }
 
+            # Operators that benefit from a numeric cast when applied to JSONB text output
+            numeric_ops = {"GREATER_THAN", "LESS_THAN", "GREATER_THAN_OR_EQUAL", "LESS_THAN_OR_EQUAL", "BETWEEN", "NOT_BETWEEN", ">", "<", ">=", "<="}
+
             for condition in parsed_filters:
                 col_info = condition.get("column") or {}
                 col_name = col_info.get("name")
-                if not col_name or not isinstance(col_name, str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name):
+                
+                if not col_name or not isinstance(col_name, str):
                     logger.warning(f"Skipping filter with invalid column name: {col_name}")
                     continue
+
+                # JSONB path filter: dynamically check if the column name contains a dot separator
+                is_jsonb_path = "." in col_name
+
+                if is_jsonb_path:
+                    parts = col_name.split(".")
+                    root_col = parts[0]
+                    json_parts = parts[1:]
+                    
+                    # Validate root column
+                    if not root_col or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", root_col):
+                        logger.warning(f"Skipping filter with invalid root JSONB column: {root_col}")
+                        continue
+
+                    # Validate nested path parts
+                    if not json_parts or not all(re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", p) for p in json_parts if p):
+                        logger.warning(f"Skipping filter with invalid JSONB path: {col_name}")
+                        continue
+                        
+                    # Build PostgreSQL JSONB path expression: "root_col"->'p1'->>'lastPart'
+                    col_expr = f'"{root_col}"'
+                    for i, part in enumerate(json_parts):
+                        col_expr += f"->>'{part}'" if i == len(json_parts) - 1 else f"->'{part}'"
+                else:
+                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name):
+                        logger.warning(f"Skipping filter with invalid column name: {col_name}")
+                        continue
+                    col_expr = f'"{col_name}"'
 
                 raw_operator = condition.get("operator")
                 op_key = str(raw_operator).strip().upper().replace(" ", "_") if raw_operator else None
@@ -100,6 +132,10 @@ class PostgresConnector(SqlConnector):
                     logger.warning(f"Skipping unsupported operator '{raw_operator}' for column '{col_name}'")
                     continue
 
+                # For JSONB paths with numeric comparison operators, cast the text output to numeric
+                if is_jsonb_path and op_key in numeric_ops:
+                    col_expr = f"({col_expr})::numeric"
+
                 value = condition.get("value")
                 value_to = condition.get("valueTo")
 
@@ -107,7 +143,7 @@ class PostgresConnector(SqlConnector):
                     if value is None or value_to is None:
                         logger.warning(f"Skipping BETWEEN filter for '{col_name}' because bounds are missing.")
                         continue
-                    clauses.append(f"\"{col_name}\" {sql_op} %s AND %s")
+                    clauses.append(f"{col_expr} {sql_op} %s AND %s")
                     params.extend([value, value_to])
                 elif op_key in ("IN", "NOT_IN"):
                     values = value
@@ -117,22 +153,22 @@ class PostgresConnector(SqlConnector):
                         logger.warning(f"Skipping IN filter for '{col_name}' due to empty values.")
                         continue
                     placeholders = ", ".join(["%s"] * len(values))
-                    clauses.append(f"\"{col_name}\" {sql_op} ({placeholders})")
+                    clauses.append(f"{col_expr} {sql_op} ({placeholders})")
                     params.extend(values)
                 elif op_key in ("IS_NULL", "IS_NOT_NULL"):
-                    clauses.append(f"\"{col_name}\" {sql_op}")
+                    clauses.append(f"{col_expr} {sql_op}")
                 elif isinstance(sql_op, tuple):
                     sql_operator, pattern_builder = sql_op
                     if value is None:
                         logger.warning(f"Skipping filter for '{col_name}' because value is missing.")
                         continue
-                    clauses.append(f"\"{col_name}\" {sql_operator} %s")
+                    clauses.append(f"{col_expr} {sql_operator} %s")
                     params.append(pattern_builder(value))
                 else:
                     if value is None:
                         logger.warning(f"Skipping filter for '{col_name}' because value is missing.")
                         continue
-                    clauses.append(f"\"{col_name}\" {sql_op} %s")
+                    clauses.append(f"{col_expr} {sql_op} %s")
                     params.append(value)
 
         where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
