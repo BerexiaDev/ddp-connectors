@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 import pyodbc
 from loguru import logger
@@ -317,3 +317,92 @@ class SqlServerConnector(SqlConnector):
                 yield dict(zip(col_names, row))
 
             offset += batch_size
+
+    def get_table_indexes(self, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Return index definitions for a table from SQL Server catalogs.
+
+        Accepts:
+        - "agent" (defaults schema to dbo)
+        - "dbo.agent" or "schema.table"
+
+        Output example:
+        [
+        {"name": "IX_agent_sex_datnaiss", "unique": False, "primary": False, "columns": ["sexagent","datnaiss"]},
+        {"name": "PK_agent", "unique": True, "primary": True, "columns": ["numaffil"]}
+        ]
+        """
+
+        def _split_schema_table(t: str) -> Tuple[str, str]:
+            t = (t or "").strip()
+            # allow [dbo].[agent] style too
+            t = t.replace("[", "").replace("]", "")
+            if "." in t:
+                s, tb = t.split(".", 1)
+                return s.strip(), tb.strip()
+            return "dbo", t.strip()
+
+        schema_name, pure_table = _split_schema_table(table_name)
+
+        conn = self.get_connection()
+        cur = conn.cursor()
+        try:
+            # Only key columns (exclude included columns); ordered by key_ordinal.
+            # Filter out hypothetical/system indexes; keep clustered/nonclustered only.
+            sql = """
+            SELECT
+            i.name AS index_name,
+            i.is_unique,
+            i.is_primary_key,
+            STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns_csv
+            FROM sys.indexes i
+            JOIN sys.objects o
+            ON o.object_id = i.object_id
+            JOIN sys.schemas s
+            ON s.schema_id = o.schema_id
+            JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.columns c
+            ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE s.name = ?
+            AND o.name = ?
+            AND o.type = 'U'
+            AND i.name IS NOT NULL
+            AND i.is_hypothetical = 0
+            AND i.type_desc IN ('CLUSTERED', 'NONCLUSTERED')
+            AND ic.is_included_column = 0
+            AND ic.key_ordinal > 0
+            GROUP BY i.name, i.is_unique, i.is_primary_key
+            ORDER BY i.is_primary_key DESC, i.is_unique DESC, i.name;
+            """
+
+            cur.execute(sql, (schema_name, pure_table))
+            rows = cur.fetchall()
+
+            results: List[Dict[str, Any]] = []
+            for r in rows:
+                idxname = r[0]
+                is_unique = bool(r[1])
+                is_primary = bool(r[2])
+                cols_csv = r[3] or ""
+                cols = [c.strip() for c in cols_csv.split(",") if c.strip()]
+                if not cols:
+                    continue
+
+                results.append(
+                    {
+                        "name": idxname,
+                        "unique": bool(is_unique or is_primary),  # PK implies unique
+                        "primary": bool(is_primary),
+                        "columns": cols,
+                    }
+                )
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Error getting indexes for SQL Server table {schema_name}.{pure_table}: {e}")
+            return []
+        finally:
+            cur.close()
+            conn.close()

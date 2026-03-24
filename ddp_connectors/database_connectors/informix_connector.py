@@ -1,7 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 from datetime import datetime
-from typing import List, Dict
+from typing import Any, List, Dict
 import pyodbc
 from loguru import logger
 from pyodbc import Cursor
@@ -392,6 +392,109 @@ class InformixConnector(SqlConnector):
             cursor.execute(sql)
             row = cursor.fetchone()
             return (row[0], row[1]) if row else (None, None)
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_table_indexes(self, table_name: str) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            raw = (table_name or "")
+            lookup = raw.strip()
+            lookup_no_quotes = lookup.replace('"', '').replace("'", "").strip()
+            if "." in lookup_no_quotes:
+                lookup_no_quotes = lookup_no_quotes.split(".")[-1].strip()
+
+            logger.info(f"[IFX][IDX] get_table_indexes raw_table_name={raw!r} lookup={lookup_no_quotes!r}")
+
+            # 1) Get tabid once
+            safe_name = table_name.replace("'", "''")
+            sql_tabid = (
+                "SELECT tabid FROM systables WHERE tabtype = 'T' AND tabname = '%s'"
+                % safe_name
+            )
+            logger.info(f"[IFX][IDX] tabid_sql={sql_tabid}")
+            cursor.execute(sql_tabid)
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"Table not found in Informix catalogs: {table_name}")
+                return []
+            tabid = int(row[0])
+            logger.info(f"[IFX][IDX] tabid={tabid} for table={table_name!r}")
+
+            sql_idx = """
+                SELECT
+                    idxname, idxtype,
+                    part1, part2, part3, part4, part5, part6, part7, part8,
+                    part9, part10, part11, part12, part13, part14, part15, part16
+                FROM sysindexes
+                WHERE tabid = ?
+            """
+            logger.info(f"[IFX][IDX] fetching sysindexes for tabid={tabid}")
+            cursor.execute(sql_idx, (tabid,))
+            index_rows = cursor.fetchall()
+            logger.info(f"[IFX][IDX] sysindexes rows={len(index_rows)} for tabid={tabid}")
+            if not index_rows:
+                return []
+
+            cursor.execute("SELECT colno, colname FROM syscolumns WHERE tabid = ?", (tabid,))
+            col_map = {int(r[0]): r[1].strip() for r in cursor.fetchall()}
+            logger.info(f"[IFX][IDX] syscolumns mapped cols={len(col_map)}")
+
+            cursor.execute(
+                """
+                SELECT constrtype, idxname
+                FROM sysconstraints
+                WHERE tabid = ?
+                AND constrtype IN ('P', 'U')
+                """,
+                (tabid,),
+            )
+            constraint_map: Dict[str, str] = {}
+            rows = cursor.fetchall()
+            logger.info(f"[IFX][IDX] sysconstraints P/U rows={len(rows)}")
+            for r in rows:
+                constrtype = r[0].strip() if r[0] else None
+                idxname = r[1].strip() if r[1] else None
+                if constrtype and idxname:
+                    constraint_map[idxname] = constrtype
+
+            results: List[Dict[str, Any]] = []
+            for r in index_rows:
+                idxname = (r[0] or "").strip()
+                idxtype = (r[1] or "").strip()
+
+                parts = [p for p in r[2:] if p is not None and int(p) > 0]
+                cols: List[str] = []
+                for colno in parts:
+                    colname = col_map.get(int(colno))
+                    if colname:
+                        cols.append(colname)
+
+                if not cols:
+                    continue
+
+                constrtype = constraint_map.get(idxname)
+                is_primary = constrtype == "P"
+                is_unique = is_primary or (constrtype == "U")
+
+                results.append(
+                    {
+                        "name": idxname,
+                        "unique": bool(is_unique),
+                        "primary": bool(is_primary),
+                        "columns": cols,
+                        "source_idxtype": idxtype,
+                    }
+                )
+
+            logger.info(f"[IFX][IDX] returning {len(results)} index defs")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error getting indexes for Informix table {table_name}: {e}")
+            return []
         finally:
             cursor.close()
             conn.close()

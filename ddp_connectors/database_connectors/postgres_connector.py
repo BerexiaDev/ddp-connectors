@@ -582,28 +582,28 @@ class PostgresConnector(SqlConnector):
 
 
     
-    def  build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns = []):
+    def build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns=None):
         """
         Generates a PostgreSQL CREATE TABLE statement along with a CREATE INDEX statement
         (for indexed columns) using the provided column metadata.
         """
+        if columns is None:
+            columns = []
+            
         column_defs = []
         primary_keys = []
         index_keys = []
-        # matches func_name(…)  or   schema.func_name(…)
-        fun_call = re.compile(r'^[A-Za-z_][\w\.]*\s*\(.*\)$')
         for col in columns:
             col_name = col["name"]
-            col_type = col["type"].upper()
+            col_type = col["type"]
             length = col.get("length")
             nullable = col["nullable"].strip() == "YES"
-            default = col["default"] or ""
             is_pk = col["primary_key"].strip() == "YES"
             if col['is_index'] == "YES":
                 index_keys.append(col_name)
 
-            # Handle types with length
-            if col_type in ("VARCHAR", "CHAR") and length:
+            # Only append length if it's a string type that doesn't already have it
+            if col_type.upper() in ("VARCHAR", "CHAR") and length and "(" not in col_type:
                 col_type_str = f"{col_type}({length})"
             else:
                 col_type_str = col_type
@@ -614,19 +614,10 @@ class PostgresConnector(SqlConnector):
             if not nullable:
                 col_def_parts.append("NOT NULL")
 
-                # DEFAULT handling
-            if default:
-                d = default
-                # is this a function call?  (unquoted identifier + '(')
-                if not fun_call.match(d):
-                    # it’s either a literal ('…'), numeric (1234), casted literal ('…'::text), etc.
-                    col_def_parts.append(f"DEFAULT {d}")
-                # else: skip it
-
             column_defs.append(" ".join(col_def_parts))
 
-            # if is_pk:
-            #     primary_keys.append(f'"{col_name}"')
+            if is_pk:
+                primary_keys.append(f'"{col_name}"')
 
         # Append primary key constraint
         if primary_keys:
@@ -647,7 +638,6 @@ class PostgresConnector(SqlConnector):
             index_stmt = ";\n".join(index_statements) + ";"
 
         return create_stmt, index_stmt
-
 
     def get_view_columns(self, table_name: str, schema_name: str = 'populations'):
         """
@@ -925,3 +915,215 @@ class PostgresConnector(SqlConnector):
                 cursor.close()
             if conn:
                 conn.close()
+
+    def analyze_table(self, schema: str, table: str) -> None:
+        """
+        Refresh Postgres planner statistics after bulk load + index creation.
+        """
+        conn = None
+        cursor = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            qualified_table = f'"{schema}"."{table}"'
+            cursor.execute(f"ANALYZE {qualified_table};")
+            conn.commit()
+            logger.info(f"ANALYZE completed for {schema}.{table}")
+        except Exception as e:
+            logger.error(f"Failed to ANALYZE {schema}.{table}: {e}")
+            if conn:
+                conn.rollback()
+            # don't raise: ANALYZE failure shouldn't break sync completion
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
+    def create_indexes_from_defs(self, schema: str, table: str, index_defs: List[Dict[str, Any]]) -> None:
+        """
+        Create indexes in Postgres from saved index definitions.
+
+        index_defs item example:
+        {
+            "columns": ["sexagent", "datnaiss"],
+            "unique": False,
+            "primary": False
+        }
+
+        Notes:
+        - Skips primary indexes (PK handled by constraint)
+        - Creates composite indexes as a single index (does not split)
+        - Idempotent with IF NOT EXISTS
+        """
+        if not index_defs:
+            return
+
+        def _slug(s: str) -> str:
+            s = (s or "").strip().lower()
+            s = re.sub(r"[^a-z0-9_]+", "_", s)
+            s = re.sub(r"_+", "_", s).strip("_")
+            return s
+
+        def _idx_name(cols: List[str], unique: bool) -> str:
+            # Keep consistent with your naming: idx_<schema>_<table>_<cols...>[_uniq]
+            base = f"idx_{_slug(schema)}_{_slug(table)}_" + "_".join(_slug(c) for c in cols)
+            if unique:
+                base += "_uniq"
+            # Postgres identifier limit is 63 bytes
+            return base[:63]
+
+        conn = None
+        cursor = None
+        qualified_table = f'"{schema}"."{table}"'
+
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            created = 0
+            skipped = 0
+
+            for d in index_defs:
+                if d.get("primary"):
+                    skipped += 1
+                    continue
+
+                cols = d.get("columns") or []
+                cols = [c.strip() for c in cols if isinstance(c, str) and c.strip()]
+                if not cols:
+                    skipped += 1
+                    continue
+
+                unique = bool(d.get("unique", False))
+                index_name = _idx_name(cols, unique)
+
+                cols_sql = ", ".join(f'"{c}"' for c in cols)
+                ddl = (
+                    f'CREATE {"UNIQUE " if unique else ""}INDEX IF NOT EXISTS "{index_name}" '
+                    f'ON {qualified_table} ({cols_sql});'
+                )
+
+                cursor.execute(ddl)
+                created += 1
+
+            conn.commit()
+            logger.info(
+                f"Indexes applied on {schema}.{table}: created/verified={created}, skipped={skipped}"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed creating indexes on {schema}.{table} from defs: {e}")
+            if conn:
+                conn.rollback()
+            raise  # here I *would* raise, because index creation is part of your feature test
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
+
+    def drop_secondary_indexes(self, schema: str, table: str) -> List[str]:
+        """
+        Drop all non-primary indexes on schema.table.
+        Keeps the PRIMARY KEY index (created by PK constraint).
+        Returns list of dropped index names.
+        """
+        conn = None
+        cur = None
+        dropped: List[str] = []
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                SELECT
+                i.relname AS index_name
+                FROM pg_index ix
+                JOIN pg_class t      ON t.oid = ix.indrelid
+                JOIN pg_namespace n  ON n.oid = t.relnamespace
+                JOIN pg_class i      ON i.oid = ix.indexrelid
+                WHERE n.nspname = %s
+                AND t.relname = %s
+                AND ix.indisprimary = false;
+                """,
+                (schema, table),
+            )
+            idx_names = [r[0] for r in cur.fetchall()]
+
+            for idx in idx_names:
+                # index itself lives in same schema typically; DROP INDEX accepts qualified name
+                cur.execute(f'DROP INDEX IF EXISTS "{schema}"."{idx}";')
+                dropped.append(idx)
+
+            conn.commit()
+            logger.info(f"Dropped {len(dropped)} secondary indexes on {schema}.{table}")
+            return dropped
+
+        except Exception as e:
+            logger.error(f"Failed dropping secondary indexes on {schema}.{table}: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
+
+    def get_table_indexes(self, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Return index definitions for a table from PostgreSQL catalogs.
+
+        Output example:
+        [
+        {"name": "idx_agent_sex_datnaiss", "unique": False, "primary": False, "columns": ["sexagent","datnaiss"]},
+        {"name": "pk_schema_agent", "unique": True, "primary": True, "columns": ["numaffil"]}
+        ]
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        try:
+            sql = """
+            SELECT
+            i.relname AS index_name,
+            ix.indisunique AS is_unique,
+            ix.indisprimary AS is_primary,
+            array_agg(a.attname ORDER BY k.ordinality) AS columns
+            FROM pg_index ix
+            JOIN pg_class t      ON t.oid = ix.indrelid
+            JOIN pg_namespace n  ON n.oid = t.relnamespace
+            JOIN pg_class i      ON i.oid = ix.indexrelid
+            JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
+            JOIN pg_attribute a  ON a.attrelid = t.oid AND a.attnum = k.attnum
+            WHERE n.nspname = %s
+            AND t.relname = %s
+            GROUP BY i.relname, ix.indisunique, ix.indisprimary
+            ORDER BY ix.indisprimary DESC, ix.indisunique DESC, i.relname;
+            """
+            cur.execute(sql, (self.schema, table_name))
+            rows = cur.fetchall()
+
+            results: List[Dict[str, Any]] = []
+            for index_name, is_unique, is_primary, cols in rows:
+                if not cols:
+                    continue
+                results.append(
+                    {
+                        "name": index_name,
+                        "unique": bool(is_unique),
+                        "primary": bool(is_primary),
+                        "columns": list(cols),
+                    }
+                )
+            return results
+
+        except Exception as e:
+            logger.error(f"Error getting indexes for Postgres table {self.schema}.{table_name}: {e}")
+            return []
+        finally:
+            cur.close()
+            conn.close()
