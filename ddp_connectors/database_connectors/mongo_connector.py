@@ -65,7 +65,7 @@ class MongoConnector:
             # Insert data in chunks
             for i in range(0, len(data), batch_size):
                 batch = data[i:i + batch_size]
-                # ordered=False allows MongoDB to continue inserting the batch even if one document fails (e.g., duplicate _id)
+                # ordered=False allows MongoDB to continue inserting the batch even if one document fails (ex., duplicate _id)
                 result = collection.insert_many(batch, ordered=False)
                 total_inserted += len(result.inserted_ids)
                 
@@ -180,8 +180,7 @@ class MongoConnector:
         client = self.get_connection()
         try:
             db = client[self.database_name]
-            # estimated_document_count is much faster than count_documents({}) for full collections
-            return db[table_name].estimated_document_count()
+            return db[table_name].count_documents({})
         except Exception as e:
             logger.error(f"Error getting table total rows: {str(e)}")
             return 0
@@ -275,9 +274,6 @@ class MongoConnector:
             cursor = db[log_table].aggregate(pipeline, batchSize=batch_size)
             
             for doc in cursor:
-                # Omit the internal _id if it's not the primary key you requested
-                if primary_key != "_id":
-                    doc.pop("_id", None)
                 yield doc
                 
         finally:
