@@ -1,16 +1,13 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-import json
-import re
 import oracledb
 from datetime import datetime
 
 from loguru import logger
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from .sql_connector import SqlConnector
 from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
 
 from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
+from ddp_lib.utils import serialize_if_needed
 
 
 class OracleConnector(SqlConnector):
@@ -99,13 +96,16 @@ class OracleConnector(SqlConnector):
         query = f'INSERT INTO {schema_prefix}"{table_name}" ({col_names_str}) VALUES ({bind_vars_str})'
 
         # 3. Convert List[Dict] to List[Tuple] matching the column order
-        tupe_data = [tuple(row.get(col) for col in columns) for row in data]
+        optimized_data = [
+            tuple(serialize_if_needed(val) for val in row)
+            for row in data
+        ]
 
         conn = self.get_connection()
         
         try:
             with conn.cursor() as cursor:
-                cursor.executemany(query, tupe_data)
+                cursor.executemany(query, optimized_data)
                 conn.commit()
                 
                 inserted_count = cursor.rowcount
