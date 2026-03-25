@@ -6,6 +6,22 @@ from loguru import logger
 from typing import Dict, Any, List, Tuple
 from pymongo import MongoClient
 
+from bson.decimal128 import Decimal128
+from bson.codec_options import TypeCodec, TypeRegistry, CodecOptions
+from decimal import Decimal
+
+class DecimalCodec(TypeCodec):
+    python_type = Decimal    # When PyMongo sees a Python Decimal
+    bson_type = Decimal128   # it should convert it to a Mongo Decimal128
+
+    def transform_python(self, value):
+        return Decimal128(value)
+
+    def transform_bson(self, value):
+        return value.to_decimal()
+
+type_registry = TypeRegistry([DecimalCodec()])
+codec_options = CodecOptions(type_registry=type_registry)
 
 class MongoConnector:
 
@@ -47,7 +63,7 @@ class MongoConnector:
             
         return MongoClient(uri)
 
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]], batch_size: int = 10_000) -> int:
+    def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
         """
         Inserts a list of dictionaries into the specified MongoDB collection using insert_many.
         """
@@ -60,16 +76,11 @@ class MongoConnector:
         
         try:
             db = client[self.database_name]
-            collection = db[table_name]
+            collection = db.get_collection(table_name, codec_options=codec_options)
 
-            # Insert data in chunks
-            for i in range(0, len(data), batch_size):
-                batch = data[i:i + batch_size]
-                # ordered=False allows MongoDB to continue inserting the batch even if one document fails (ex., duplicate _id)
-                result = collection.insert_many(batch, ordered=False)
-                total_inserted += len(result.inserted_ids)
-                
-            logger.info(f"Successfully inserted {total_inserted} documents into {table_name}.")
+            # ordered=False allows MongoDB to continue inserting the batch even if one document fails (ex., duplicate _id)
+            result = collection.insert_many(data, ordered=False)
+            total_inserted += len(result.inserted_ids)
             return total_inserted
             
         except Exception as exc:
@@ -300,3 +311,12 @@ class MongoConnector:
             return []
         finally:
             client.close()
+
+    def build_create_table_statement(self, table_name: str, columns: List[Dict[str, Any]]) -> str:
+        """In MongoDB, databases and collections are created lazily upon the first insert."""
+        
+        return None, None
+    
+    def create_table_if_missing(self, table_name: str, create_table_statement: str, index_table_statement: str = None):
+        """In MongoDB, databases and collections are created lazily upon the first insert."""
+        return True
