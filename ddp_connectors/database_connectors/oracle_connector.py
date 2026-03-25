@@ -72,14 +72,13 @@ class OracleConnector(SqlConnector):
         return conn
 
     
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]], batch_size: int = 10_000) -> int:
+    def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
         """
         Inserts a list of dictionaries into the specified Oracle table using executemany.
         
         Args:
             table_name (str): The target table name.
             data (List[Dict[str, Any]]): The data to insert, where each dictionary is a row.
-            batch_size (int): The number of rows to insert per batch to manage memory.
             
         Returns:
             int: The total number of rows successfully inserted.
@@ -89,38 +88,30 @@ class OracleConnector(SqlConnector):
             return 0
 
         # 1. Extract column names from the first dictionary
-        # Assumes all dictionaries in the list have the same keys
         columns = list(data[0].keys())
         
-        # 2. Build the parameterised SQL statement
-        # Double-quote columns to preserve case if needed, and use Oracle bind variables (:1, :2)
-        cols_str = ", ".join([f'"{col}"' for col in columns])
-        binds_str = ", ".join([f":{i+1}" for i in range(len(columns))])
+        # 2. Build the parameterized SQL statement
+        col_names_str = ", ".join([f'"{col}"' for col in columns])
+        bind_vars_str = ", ".join([f":{i+1}" for i in range(len(columns))])
         
-        sql = f'INSERT INTO {self.schema}."{table_name.upper()}" ({cols_str}) VALUES ({binds_str})'
-        logger.debug(f"Insert SQL prepared: {sql}")
+        # Safely handle the schema (ignore 'public') and preserve exact table case
+        schema_prefix = f'"{self.schema}".' if getattr(self, 'schema', None) and self.schema.lower() != 'public' else ""
+        query = f'INSERT INTO {schema_prefix}"{table_name}" ({col_names_str}) VALUES ({bind_vars_str})'
 
         # 3. Convert List[Dict] to List[Tuple] matching the column order
-        rows_to_insert = [tuple(row.get(col) for col in columns) for row in data]
-        
-        total_inserted = 0
+        tupe_data = [tuple(row.get(col) for col in columns) for row in data]
+
         conn = self.get_connection()
         
         try:
             with conn.cursor() as cursor:
-                # 4. Insert data in chunks using executemany
-                for i in range(0, len(rows_to_insert), batch_size):
-                    batch = rows_to_insert[i:i + batch_size]
-                    
-                    # executemany is significantly faster than executing row-by-row
-                    cursor.executemany(sql, batch)
-                    total_inserted += cursor.rowcount
-                    
-                # 5. Explicitly commit the transaction
+                cursor.executemany(query, tupe_data)
                 conn.commit()
-                logger.info(f"Successfully inserted {total_inserted} rows into {self.schema}.{table_name}.")
                 
-                return total_inserted
+                inserted_count = cursor.rowcount
+                logger.info(f"Successfully inserted {inserted_count} rows into {table_name}.")
+                
+                return inserted_count
                 
         except Exception as exc:
             conn.rollback()
