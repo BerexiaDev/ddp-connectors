@@ -24,37 +24,40 @@ class OracleConnector(SqlConnector):
     def ping(self) -> bool:
         """
         Tests the database connection and verifies the target schema exists.
-        Returns True if successful, raises an Exception or returns False if not.
+        Returns True if successful, otherwise False.
         """
+        conn = None
         try:
-            # 1. This tests if the Host, Port, Database, User, and Password are correct.
-            # If get_connection() fails, it throws an exception immediately.
             conn = self.get_connection()
-            
+
+            logger.info(f"conn: {conn}")
+
             with conn.cursor() as cursor:
-                # 2. Basic sanity check (Ping)
+                # Basic ping
                 cursor.execute("SELECT 1 FROM DUAL")
-                
+                cursor.fetchone()
+
+                # Check schema exists
                 cursor.execute(
-                    "SELECT count(*) FROM all_users WHERE username = :schema_name",
-                    schema_name=self.schema
+                    "SELECT COUNT(*) FROM all_users WHERE username = :schema_name",
+                    schema_name=self.schema.upper()
                 )
-                
                 schema_count = cursor.fetchone()[0]
-                
+
                 if schema_count == 0:
                     logger.error(f"Ping failed: Schema '{self.schema}' does not exist.")
                     return False
-                    
+
             logger.info(f"Successfully pinged Oracle database and verified schema: {self.schema}")
             return True
-            
+
         except Exception as exc:
             logger.error(f"Oracle connection ping failed: {exc}")
             return False
-            
+
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
     
     def get_connection(self):
         # automatically fetch CLOBs/BLOBs as strings/bytes
@@ -347,3 +350,116 @@ class OracleConnector(SqlConnector):
             return []
         finally:
             conn.close()
+
+
+    def build_create_table_statement(self, table_name: str, schema_name: str = None, columns=None):
+        """
+        Generates an Oracle CREATE TABLE statement along with CREATE INDEX statements
+        (for indexed columns) using the provided column metadata.
+        """
+        if columns is None:
+            columns = []
+            
+        column_defs = []
+        primary_keys = []
+        index_keys = []
+        
+        for col in columns:
+            col_name = col["name"]
+            col_type = col["type"]
+            length = col.get("length")
+            nullable = str(col.get("nullable", "")).strip().upper() == "YES"
+            is_pk = str(col.get("primary_key", "")).strip().upper() == "YES"
+            
+            if str(col.get("is_index", "")).strip().upper() == "YES":
+                index_keys.append(col_name)
+
+            # Oracle specific string/binary types that need length
+            base_type = col_type.split('(')[0].strip().upper()
+            if base_type in ("VARCHAR2", "CHAR", "RAW") and length and "(" not in col_type:
+                col_type_str = f"{col_type}({length})"
+            else:
+                col_type_str = col_type
+
+            # Build column definition
+            # Quotes ensure case-sensitivity matches the extracted Postgres schema exactly
+            col_def_parts = [f'"{col_name}"', col_type_str]
+
+            if not nullable:
+                col_def_parts.append("NOT NULL")
+
+            column_defs.append(" ".join(col_def_parts))
+
+            if is_pk:
+                primary_keys.append(f'"{col_name}"')
+
+        # Append primary key constraint
+        if primary_keys:
+            pk_def = f"PRIMARY KEY ({', '.join(primary_keys)})"
+            column_defs.append(pk_def)
+
+        columns_sql = ",\n  ".join(column_defs)
+        
+        # Postgres often uses 'public', but Oracle uses the schema (user) name.
+        # If schema_name is 'public', we omit it so Oracle defaults to the current logged-in user.
+        schema_prefix = f'"{schema_name}".' if schema_name and schema_name.lower() != 'public' else ""
+        
+        # Standard Oracle CREATE TABLE (No IF NOT EXISTS)
+        create_stmt = f'CREATE TABLE {schema_prefix}"{table_name}" (\n  {columns_sql}\n);'
+        
+        index_stmt = None
+        if index_keys:
+            index_statements = []
+            for col in index_keys:
+                # Safely slice table and column names for index naming to prevent ORA-00972 (name too long)
+                idx_name = f"IDX_{table_name[:12]}_{col[:12]}".upper()
+                index_statements.append(
+                    f'CREATE INDEX "{idx_name}" ON {schema_prefix}"{table_name}" ("{col}")'
+                )
+            index_stmt = ";\n".join(index_statements) + ";"
+
+        return create_stmt, index_stmt
+
+
+    def create_table_if_missing(self, table_name: str, create_table_statement: str, index_table_statement: str = None):
+        """Creates a table and its indexes in Oracle, handling 'already exists' natively."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if not create_table_statement or not index_table_statement:
+            logger.error(f"create_table_statement or index_table_statement is empty")
+            return
+        
+        try:
+            # 1. Strip the trailing semicolon; Oracle drivers reject it in execute()
+            clean_create_stmt = create_table_statement.strip().rstrip(';')
+            cursor.execute(clean_create_stmt)
+            logger.info(f"Table {table_name} created successfully.")
+            
+        except Exception as e:
+            if "ORA-00955" in str(e):
+                logger.info(f"Table {table_name} already exists. Skipping creation.")
+            else:
+                logger.error(f"Failed to create table {table_name}: {e}")
+                cursor.close()
+                conn.close()
+                return
+
+        # 2. Handle Indexes
+        try:
+            if index_table_statement:
+                index_stmts = [stmt.strip().rstrip(';') for stmt in index_table_statement.split(';') if stmt.strip()]
+                
+                for idx_stmt in index_stmts:
+                    try:
+                        cursor.execute(idx_stmt)
+                        logger.info(f"Index created on {table_name}.")
+                    except Exception as e:
+                        # Catch ORA-00955 again in case the index already exists
+                        if "ORA-00955" in str(e) or "ORA-01408" in str(e): # ORA-01408: such column list already indexed
+                            logger.info(f"Index on {table_name} already exists. Skipping.")
+                        else:
+                            logger.error(f"Failed to create index on {table_name}: {e}")
+        finally:
+            cursor.close()
+            conn.close()
+

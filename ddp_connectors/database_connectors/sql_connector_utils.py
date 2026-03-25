@@ -560,3 +560,148 @@ def cast_oracle_to_postgresql_type(oracle_type: str) -> str:
     }
 
     return oracle_to_pg.get(oracle_type_normalized, "TEXT")
+
+def map_postgres_type(pg_type: str, target_db: str = "postgres") -> str:
+    """
+    Convert a PostgreSQL type string to the equivalent type
+    for the target database: postgres, oracle, or informix.
+    """
+    if not pg_type:
+        return pg_type
+
+    original_type = pg_type.strip()
+    target_db = (target_db or "postgres").strip().lower()
+
+    if target_db in ("postgres", "postgresql"):
+        return original_type.upper()
+
+    # -----------------------------
+    # Parse PostgreSQL type safely
+    # -----------------------------
+    clean_type = original_type.lower().strip()
+
+    is_array = clean_type.endswith("[]")
+    if is_array:
+        clean_type = clean_type[:-2].strip()
+
+    args = None
+    paren_match = re.search(r"\(([^)]+)\)", clean_type)
+    if paren_match:
+        args = paren_match.group(1).strip()
+        clean_type = re.sub(r"\([^)]+\)", "", clean_type).strip()
+
+    base_type = re.sub(r"\s+", " ", clean_type).strip()
+
+    # Normalize aliases
+    if base_type in ("character varying",):
+        base_type = "varchar"
+    elif base_type in ("character",):
+        base_type = "char"
+    elif base_type == "timestamp without time zone":
+        base_type = "timestamp"
+    elif base_type == "timestamp with time zone":
+        base_type = "timestamptz"
+    elif base_type == "time without time zone":
+        base_type = "time"
+    elif base_type == "time with time zone":
+        base_type = "timetz"
+
+    # -----------------------------
+    # Oracle mapping
+    # -----------------------------
+    if target_db == "oracle":
+        if is_array:
+            return "CLOB"
+
+        if base_type == "varchar":
+            return f"VARCHAR2({args})" if args else "VARCHAR2(4000)"
+        if base_type == "char":
+            return f"CHAR({args})" if args else "CHAR"
+        if base_type in ("numeric", "decimal"):
+            return f"NUMBER({args})" if args else "NUMBER"
+        if base_type in ("bit", "bit varying"):
+            return f"RAW({args})" if args else "RAW(2000)"
+
+        oracle_map = {
+            "smallint": "NUMBER(5)",
+            "integer": "NUMBER(10)",
+            "int": "NUMBER(10)",
+            "bigint": "NUMBER(19)",
+            "real": "BINARY_FLOAT",
+            "double precision": "BINARY_DOUBLE",
+            "money": "NUMBER(19,4)",
+            "serial": "NUMBER(10)",
+            "bigserial": "NUMBER(19)",
+            "text": "CLOB",
+            "bytea": "BLOB",
+            "timestamp": "TIMESTAMP",
+            "timestamptz": "TIMESTAMP WITH TIME ZONE",
+            "date": "DATE",
+            "time": "VARCHAR2(15)",     # Oracle has no pure TIME type
+            "timetz": "VARCHAR2(20)",
+            "interval": "INTERVAL DAY TO SECOND",
+            "boolean": "NUMBER(1)",
+            "uuid": "VARCHAR2(36)",
+            "json": "CLOB",
+            "jsonb": "CLOB",
+            "xml": "XMLTYPE",
+            "inet": "VARCHAR2(64)",
+            "cidr": "VARCHAR2(64)",
+            "macaddr": "VARCHAR2(32)",
+        }
+
+        return oracle_map.get(base_type, "VARCHAR2(4000)")
+
+    # -----------------------------
+    # Informix mapping
+    # -----------------------------
+    if target_db == "informix":
+        if is_array:
+            return "LVARCHAR"
+
+        if base_type == "varchar":
+            if args:
+                return f"LVARCHAR({args})" if args.isdigit() and int(args) > 255 else f"VARCHAR({args})"
+            return "LVARCHAR"
+
+        if base_type == "char":
+            return f"CHAR({args})" if args else "CHAR"
+
+        if base_type in ("numeric", "decimal"):
+            return f"DECIMAL({args})" if args else "DECIMAL"
+
+        if base_type in ("bit", "bit varying"):
+            return f"BYTE({args})" if args else "BYTE"
+
+        informix_map = {
+            "smallint": "SMALLINT",
+            "integer": "INTEGER",
+            "int": "INTEGER",
+            "bigint": "BIGINT",
+            "real": "SMALLFLOAT",
+            "double precision": "FLOAT",
+            "money": "MONEY",
+            "serial": "SERIAL",
+            "bigserial": "BIGSERIAL",
+            "text": "TEXT",
+            "bytea": "BLOB",
+            "timestamp": "DATETIME YEAR TO FRACTION(5)",
+            "timestamptz": "DATETIME YEAR TO FRACTION(5)",
+            "date": "DATE",
+            "time": "DATETIME HOUR TO SECOND",
+            "timetz": "DATETIME HOUR TO SECOND",
+            "interval": "INTERVAL",
+            "boolean": "BOOLEAN",
+            "uuid": "CHAR(36)",
+            "json": "LVARCHAR",
+            "jsonb": "LVARCHAR",
+            "xml": "TEXT",
+            "inet": "LVARCHAR(64)",
+            "cidr": "LVARCHAR(64)",
+            "macaddr": "LVARCHAR(32)",
+        }
+
+        return informix_map.get(base_type, "LVARCHAR")
+
+    # Unknown target DB -> keep original PG type
+    return original_type.upper()

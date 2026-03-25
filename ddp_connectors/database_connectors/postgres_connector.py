@@ -1,5 +1,3 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
 import json
 import re, psycopg2
 from datetime import datetime
@@ -11,8 +9,9 @@ from pyodbc import Cursor
 from .sql_connector import SqlConnector
 from ddp_connectors.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
     _build_having_clause
-from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript
+from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript, map_postgres_type
 from .sql_connector_utils import safe_convert_to_string
+from psycopg2.extras import execute_values
 
 
 class PostgresConnector(SqlConnector):
@@ -199,11 +198,16 @@ class PostgresConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def fetch_batch(self, cursor: Cursor, table_name, offset: int, limit: int = 100):
+    def fetch_batch(self, cursor: Cursor, table_name, offset: int, limit: int = 100, as_dict: bool = False):
         try:
             query = f'SELECT * FROM {table_name} OFFSET {offset} LIMIT {limit}'
             cursor.execute(query)
             results = cursor.fetchall()
+            if as_dict:
+                columns = [desc[0] for desc in cursor.description]
+                return [
+                    dict(zip(columns, row)) for row in results
+                ]
             return results
         except Exception as e:
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
@@ -335,7 +339,7 @@ class PostgresConnector(SqlConnector):
             cur.close()
             conn.close()
 
-    def extract_table_schema(self, table_name):
+    def extract_table_schema(self, table_name, db_type: str = "postgres"):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -399,7 +403,7 @@ class PostgresConnector(SqlConnector):
                 {
                     "position": row[0],
                     "name": row[1],
-                    "type": row[2].upper(),
+                    "type": map_postgres_type(row[2].upper(), db_type),
                     "length": row[3],
                     "nullable": row[4],
                     "default": row[5],
@@ -1126,4 +1130,20 @@ class PostgresConnector(SqlConnector):
             return []
         finally:
             cur.close()
+            conn.close()
+    
+
+    def insert_data(self, table_name: str, data: List[Dict[str, Any]]):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            table_identifier = f'"{self.schema}"."{table_name}"'
+            query = f"INSERT INTO {table_identifier} VALUES %s"
+            execute_values(cursor, query, data)
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to insert data into {table_name}: {e}")
+            conn.rollback()
+        finally:
+            cursor.close()
             conn.close()
