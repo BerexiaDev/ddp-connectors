@@ -30,8 +30,6 @@ class OracleConnector(SqlConnector):
         try:
             conn = self.get_connection()
 
-            logger.info(f"conn: {conn}")
-
             with conn.cursor() as cursor:
                 # Basic ping
                 cursor.execute("SELECT 1 FROM DUAL")
@@ -421,45 +419,61 @@ class OracleConnector(SqlConnector):
         return create_stmt, index_stmt
 
 
-    def create_table_if_missing(self, table_name: str, create_table_statement: str, index_table_statement: str = None):
-        """Creates a table and its indexes in Oracle, handling 'already exists' natively."""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        if not create_table_statement or not index_table_statement:
-            logger.error(f"create_table_statement or index_table_statement is empty")
-            return
-        
+    def create_table_if_missing(
+        self,
+        table_name: str,
+        create_table_statement: str,
+        index_table_statement: str = None,
+    ):
+        """Create a table and its indexes in Oracle, ignoring 'already exists' errors."""
+        conn = None
+        cursor = None
+
         try:
-            # 1. Strip the trailing semicolon; Oracle drivers reject it in execute()
-            clean_create_stmt = create_table_statement.strip().rstrip(';')
-            cursor.execute(clean_create_stmt)
-            logger.info(f"Table {table_name} created successfully.")
-            
-        except Exception as e:
-            if "ORA-00955" in str(e):
-                logger.info(f"Table {table_name} already exists. Skipping creation.")
-            else:
-                logger.error(f"Failed to create table {table_name}: {e}")
-                cursor.close()
-                conn.close()
+            if not create_table_statement:
+                logger.error("create_table_statement is empty")
                 return
 
-        # 2. Handle Indexes
-        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            # Create table
+            try:
+                clean_create_stmt = create_table_statement.strip().rstrip(";")
+                cursor.execute(clean_create_stmt)
+                logger.info(f"Table {table_name} created successfully.")
+            except Exception as e:
+                if "ORA-00955" in str(e):
+                    logger.info(f"Table {table_name} already exists. Skipping creation.")
+                else:
+                    logger.error(f"Failed to create table {table_name}: {e}")
+                    raise
+
+            # Create indexes if provided
             if index_table_statement:
-                index_stmts = [stmt.strip().rstrip(';') for stmt in index_table_statement.split(';') if stmt.strip()]
-                
+                index_stmts = [
+                    stmt.strip().rstrip(";")
+                    for stmt in index_table_statement.split(";")
+                    if stmt.strip()
+                ]
+
                 for idx_stmt in index_stmts:
                     try:
                         cursor.execute(idx_stmt)
-                        logger.info(f"Index created on {table_name}.")
+                        logger.info(f"Index created successfully on {table_name}.")
                     except Exception as e:
-                        # Catch ORA-00955 again in case the index already exists
-                        if "ORA-00955" in str(e) or "ORA-01408" in str(e): # ORA-01408: such column list already indexed
+                        if "ORA-00955" in str(e) or "ORA-01408" in str(e):
                             logger.info(f"Index on {table_name} already exists. Skipping.")
                         else:
                             logger.error(f"Failed to create index on {table_name}: {e}")
-        finally:
-            cursor.close()
-            conn.close()
+                            raise
 
+        except Exception as e:
+            logger.error(f"Error while creating table/indexes for {table_name}: {e}")
+            raise
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
