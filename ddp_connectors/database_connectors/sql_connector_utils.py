@@ -637,7 +637,7 @@ def map_postgres_type(pg_type: str, target_db: str = "postgres") -> str:
             "timestamp": "TIMESTAMP",
             "timestamptz": "TIMESTAMP WITH TIME ZONE",
             "date": "DATE",
-            "time": "VARCHAR2(15)",     # Oracle has no pure TIME type
+            "time": "VARCHAR2(15)",
             "timetz": "VARCHAR2(20)",
             "interval": "INTERVAL DAY TO SECOND",
             "boolean": "NUMBER(1)",
@@ -702,6 +702,5 @@ def map_postgres_type(pg_type: str, target_db: str = "postgres") -> str:
         }
 
         return informix_map.get(base_type, "LVARCHAR")
-
-    # Unknown target DB -> keep original PG type
+        
     return original_type.upper()
