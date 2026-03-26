@@ -93,8 +93,6 @@ class MongoConnector:
     def fetch_batch(self, table_name: str, offset: int, limit: int = 100):
         """
         Fetches a batch of documents using skip and limit.
-        Note: Removed the 'cursor' argument. In PyMongo, it's safer to instantiate the client locally 
-        to prevent cursor timeouts across long-running application states.
         """
         client = self.get_connection()
         try:
