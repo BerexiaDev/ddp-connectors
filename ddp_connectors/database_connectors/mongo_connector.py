@@ -90,7 +90,7 @@ class MongoConnector:
         finally:
             client.close()
 
-    def fetch_batch(self, table_name: str, offset: int, limit: int = 100):
+    def fetch_batch(self, table_name: str, offset: int, limit: int = 100, **kwargs: Any):
         """
         Fetches a batch of documents using skip and limit.
         """
