@@ -1,16 +1,13 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-import json
-import re
 import oracledb
 from datetime import datetime
 
 from loguru import logger
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from .sql_connector import SqlConnector
 from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
 
 from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
+from ddp_lib.utils import serialize_if_needed
 
 
 class OracleConnector(SqlConnector):
@@ -71,6 +68,59 @@ class OracleConnector(SqlConnector):
         conn.outputtypehandler = self._oracle_type_handler
         
         return conn
+
+    
+    def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
+        """
+        Inserts a list of dictionaries into the specified Oracle table using executemany.
+        
+        Args:
+            table_name (str): The target table name.
+            data (List[Dict[str, Any]]): The data to insert, where each dictionary is a row.
+            
+        Returns:
+            int: The total number of rows successfully inserted.
+        """
+        if not data:
+            logger.warning(f"No data provided to insert into {table_name}.")
+            return 0
+
+        # 1. Extract column names from the first dictionary
+        columns = list(data[0].keys())
+        
+        # 2. Build the parameterized SQL statement
+        col_names_str = ", ".join([f'"{col}"' for col in columns])
+        bind_vars_str = ", ".join([f":{i+1}" for i in range(len(columns))])
+        
+        # Safely handle the schema (ignore 'public') and preserve exact table case
+        schema_prefix = f'"{self.schema}".' if getattr(self, 'schema', None) and self.schema.lower() != 'public' else ""
+        query = f'INSERT INTO {schema_prefix}"{table_name}" ({col_names_str}) VALUES ({bind_vars_str})'
+
+        # 3. Convert List[Dict] to List[Tuple] matching the column order
+        optimized_data = [
+            tuple(serialize_if_needed(val) for val in row)
+            for row in data
+        ]
+
+        conn = self.get_connection()
+        
+        try:
+            with conn.cursor() as cursor:
+                cursor.executemany(query, optimized_data)
+                conn.commit()
+                
+                inserted_count = cursor.rowcount
+                logger.info(f"Successfully inserted {inserted_count} rows into {table_name}.")
+                
+                return inserted_count
+                
+        except Exception as exc:
+            conn.rollback()
+            logger.error(f"Error inserting data into {table_name}: {exc}")
+            raise
+            
+        finally:
+            conn.close()
 
     def fetch_batch(self, cursor, table_name, offset: int, limit: int = 100):
         try:
