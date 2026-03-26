@@ -1133,12 +1133,12 @@ class PostgresConnector(SqlConnector):
             conn.close()
     
 
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]]):
+    def insert_data(self, table_name: str, data: List[Dict[str, Any]], columns: List[str]):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
             table_identifier = f'"{self.schema}"."{table_name}"'
-            query = f"INSERT INTO {table_identifier} VALUES %s"
+            query = f"INSERT INTO {table_identifier} ({', '.join(columns)}) VALUES %s"
             execute_values(cursor, query, data)
             conn.commit()
         except Exception as e:

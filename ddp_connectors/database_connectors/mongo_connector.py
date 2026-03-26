@@ -63,7 +63,7 @@ class MongoConnector:
             
         return MongoClient(uri)
 
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
+    def insert_data(self, table_name: str, data: List[Dict[str, Any]], columns: List[str] = None) -> int:
         """
         Inserts a list of dictionaries into the specified MongoDB collection using insert_many.
         """
