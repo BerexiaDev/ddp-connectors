@@ -13,26 +13,26 @@ class ConnectorFactory():
     def create_connector(self, connector_type, connector_settings):
 
         if connector_type == 'sqlserver':
-            connector = SqlServerConnector(connector_settings["host"], connector_settings["user"],
-                                           connector_settings["password"],connector_settings["port"],
-                                           connector_settings["database"])
+            connector = SqlServerConnector(connector_settings.host, connector_settings.user,
+                                           connector_settings.password,connector_settings.port,
+                                           connector_settings.database)
             return connector
 
         elif connector_type == 'postgres':
-            connector = PostgresConnector(connector_settings["host"], connector_settings["user"],
-                                          connector_settings["password"], connector_settings["port"],
-                                          connector_settings["database"], connector_settings.get("schema", 'public'))
+            connector = PostgresConnector(connector_settings.host, connector_settings.user,
+                                          connector_settings.password, connector_settings.port,
+                                          connector_settings.database, connector_settings.get("schema", 'public'))
             return connector
 
         elif connector_type == 'informix':
-            connector = InformixConnector(connector_settings["host"], connector_settings["user"],
-                                          connector_settings["password"], connector_settings["port"],
-                                          connector_settings["database"], connector_settings["protocol"], connector_settings["locale"])
+            connector = InformixConnector(connector_settings.host, connector_settings.user,
+                                          connector_settings.password, connector_settings.port,
+                                          connector_settings.database, connector_settings.protocol, connector_settings.locale)
             return connector
         
         
         elif connector_type == 'oracle':
-            connector = OracleConnector(connector_settings["host"], connector_settings["user"],
-                                          connector_settings["password"], connector_settings["port"],
-                                          connector_settings["database"], connector_settings.get("schema"))
+            connector = OracleConnector(connector_settings.host, connector_settings.user,
+                                          connector_settings.password, connector_settings.port,
+                                          connector_settings.database, connector_settings.get("schema"))
             return connector
