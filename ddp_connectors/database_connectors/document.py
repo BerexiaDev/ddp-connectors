@@ -1,6 +1,6 @@
 from pymongo import UpdateOne
 from app.main import mongo
-from ddp_lib.utils.utils import generate_id
+from ddp_lib.utils import generate_id
 
 
 class Document:
