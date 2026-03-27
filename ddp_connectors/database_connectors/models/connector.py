@@ -1,4 +1,4 @@
-from ddp_connectors.database_connectors.models.document import Document
+from ddp_connectors.database_connectors.document import Document
 from ddp_connectors.database_connectors.utils.cryptography_utils import encrypt_secret, decrypt_secret
 
 
