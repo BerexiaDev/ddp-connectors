@@ -1,5 +1,5 @@
 from ddp_connectors.database_connectors.document import Document
-from ddp_connectors.database_connectors.utils.cryptography_utils import encrypt_secret, decrypt_secret
+from ddp_lib.cryptography_utils import encrypt_secret, decrypt_secret
 
 
 def _make_sensitive_property(field):

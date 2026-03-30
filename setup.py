@@ -11,7 +11,6 @@ setup(
         "sqlalchemy",
         "cx_oracle",
         "loguru",
-        "cryptography==44.0.2",
     ],
     description='Deepkube Data Platform Global Library',
     author='Berexia DEV Team',
