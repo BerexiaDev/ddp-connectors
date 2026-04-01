@@ -10,6 +10,7 @@ setup(
         "psycopg2",
         "sqlalchemy",
         "cx_oracle",
+        "mysql-connector-python",
         "loguru",
     ],
     description='Deepkube Data Platform Global Library',
