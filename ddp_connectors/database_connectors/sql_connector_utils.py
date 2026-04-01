@@ -318,6 +318,131 @@ def cast_sqlserver_to_typescript_types(sql_type: str) -> str:
     return sql_server_to_ts.get(sql_type, "any")
 
 
+def cast_mysql_to_typescript_types(mysql_type: str) -> str:
+    """
+    Convert a MySQL column type to a TypeScript-friendly type
+    using a direct dictionary lookup.
+
+    Unknown or unlisted MySQL types fall back to `'any'`.
+    """
+    mysql_type = mysql_type.lower().strip()
+
+    mysql_to_ts: Dict[str, str] = {
+        # numeric
+        "tinyint": "number",
+        "smallint": "number",
+        "mediumint": "number",
+        "int": "number",
+        "integer": "number",
+        "bigint": "number",
+        "decimal": "number",
+        "numeric": "number",
+        "float": "number",
+        "double": "number",
+        "real": "number",
+
+        # boolean
+        "bit": "boolean",
+        "bool": "boolean",
+        "boolean": "boolean",
+
+        # textual
+        "char": "string",
+        "varchar": "string",
+        "tinytext": "string",
+        "text": "string",
+        "mediumtext": "string",
+        "longtext": "string",
+        "enum": "string",
+        "set": "string",
+
+        # binary / blob
+        "binary": "string",
+        "varbinary": "string",
+        "tinyblob": "string",
+        "blob": "string",
+        "mediumblob": "string",
+        "longblob": "string",
+
+        # temporal
+        "date": "Date",
+        "time": "string",
+        "datetime": "Datetime",
+        "timestamp": "Datetime",
+        "year": "number",
+
+        # special
+        "json": "any",
+        "geometry": "any",
+        "point": "any",
+        "linestring": "any",
+        "polygon": "any",
+    }
+
+    return mysql_to_ts.get(mysql_type, "any")
+
+
+def cast_mysql_to_postgresql_type(mysql_type: str) -> str:
+    """
+    Map MySQL type to Postgres type.
+    """
+    mysql_type = mysql_type.lower().strip()
+
+    mysql_to_pg: Dict[str, str] = {
+        # Numerics
+        "tinyint": "SMALLINT",
+        "smallint": "SMALLINT",
+        "mediumint": "INTEGER",
+        "int": "INTEGER",
+        "integer": "INTEGER",
+        "bigint": "BIGINT",
+        "decimal": "NUMERIC",
+        "numeric": "NUMERIC",
+        "float": "REAL",
+        "double": "DOUBLE PRECISION",
+        "real": "DOUBLE PRECISION",
+
+        # Boolean
+        "bit": "BOOLEAN",
+        "bool": "BOOLEAN",
+        "boolean": "BOOLEAN",
+
+        # Character / Text
+        "char": "CHAR",
+        "varchar": "VARCHAR",
+        "tinytext": "TEXT",
+        "text": "TEXT",
+        "mediumtext": "TEXT",
+        "longtext": "TEXT",
+        "enum": "VARCHAR",
+        "set": "VARCHAR",
+
+        # Binary / BLOB
+        "binary": "BYTEA",
+        "varbinary": "BYTEA",
+        "tinyblob": "BYTEA",
+        "blob": "BYTEA",
+        "mediumblob": "BYTEA",
+        "longblob": "BYTEA",
+
+        # Temporal
+        "date": "DATE",
+        "time": "TIME",
+        "datetime": "TIMESTAMP",
+        "timestamp": "TIMESTAMPTZ",
+        "year": "SMALLINT",
+
+        # Special
+        "json": "JSONB",
+        "geometry": "TEXT",
+        "point": "TEXT",
+        "linestring": "TEXT",
+        "polygon": "TEXT",
+    }
+
+    return mysql_to_pg.get(mysql_type, "TEXT")
+
+
 def cast_oracle_to_typescript(oracle_type: str) -> str:
     """
     Maps an Oracle data type to a corresponding TypeScript type.
