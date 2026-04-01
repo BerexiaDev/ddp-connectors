@@ -2,6 +2,7 @@ from ddp_connectors.database_connectors.postgres_connector import PostgresConnec
 from ddp_connectors.database_connectors.sql_server_connector import SqlServerConnector
 from ddp_connectors.database_connectors.informix_connector import InformixConnector
 from ddp_connectors.database_connectors.oracle_connector import OracleConnector
+from ddp_connectors.database_connectors.mongo_connector import MongoConnector
 from ddp_connectors.database_connectors.mysql_connector import MySQLConnector
 
 
@@ -38,6 +39,12 @@ class ConnectorFactory():
                                           connector_settings["database"], connector_settings.get("schema"))
             return connector
 
+    
+        elif connector_type == 'mongo':
+            connector = MongoConnector(connector_settings["host"], connector_settings["user"],
+                                          connector_settings["password"], connector_settings["port"],
+                                          connector_settings["database"])
+            return connector
         elif connector_type == 'mysql':
             connector = MySQLConnector(connector_settings["host"], connector_settings["user"],
                                        connector_settings["password"], connector_settings["port"],
