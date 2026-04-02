@@ -12,6 +12,7 @@ from ddp_connectors.database_connectors.utils.postgres_connector_utils import _b
 from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript, map_postgres_type
 from .sql_connector_utils import safe_convert_to_string
 from psycopg2.extras import execute_values
+from ddp_lib.utils import serialize_if_needed
 
 
 class PostgresConnector(SqlConnector):
@@ -198,46 +199,56 @@ class PostgresConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def fetch_batch(self, cursor: Cursor, table_name, offset: int, limit: int = 100, as_dict: bool = False):
+    def fetch_batch(self, cursor: Cursor, table_name, offset: int, limit: int = 100, restore_mongo_docs: bool = False, as_dict: bool = False):
         try:
-            query = f'SELECT * FROM {table_name} OFFSET {offset} LIMIT {limit}'
+            select_columns = "data" if restore_mongo_docs else "*"
+            query = f'SELECT {select_columns} FROM {table_name} OFFSET {offset} LIMIT {limit}'
             cursor.execute(query)
             results = cursor.fetchall()
-            if as_dict:
+            if restore_mongo_docs:
+                return [row[0] for row in results if row[0]]
+            
+            elif as_dict:
                 columns = [desc[0] for desc in cursor.description]
                 return [
                     dict(zip(columns, row)) for row in results
                 ]
-            return results
+            else:
+                return [
+                    tuple(serialize_if_needed(v) for v in row)
+                    for row in results
+                ]
         except Exception as e:
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
-            return []
+            raise
 
-    def stream_batch(self, table_name: str, batch_size: int = 10_000,):
+    def stream_batch(self, cursor, table_name: str, batch_size: int = 10_000, restore_mongo_docs: bool = False, as_dict: bool = False, **kwargs):
         """
         Full-sync streaming for Postgres using a server-side cursor.
         Avoids OFFSET and prevents loading the full result set into memory.
         """
         conn = None
-        cursor = None
-        cursor_name = f"stream_{table_name.replace('.', '_')}"
-
         try:
-            conn = self.get_connection()
-            # IMPORTANT: server-side cursors require an open transaction
-            cursor = conn.cursor(name=cursor_name)
             cursor.itersize = batch_size
 
             logger.info(f"Start streaming Postgres table {table_name} with batch_size={batch_size}")
-            cursor.execute(f"SELECT * FROM {table_name}")
+            select_columns = "data" if restore_mongo_docs else "*"
+            cursor.execute(f"SELECT {select_columns} FROM {table_name}")
 
             while True:
                 rows = cursor.fetchmany(batch_size)
                 if not rows:
                     break
-                yield rows
-
-            logger.info(f"Finished streaming Postgres table {table_name}")
+                if restore_mongo_docs:
+                    yield [row[0] for row in rows if row[0]]
+                elif as_dict:
+                    columns = [desc[0] for desc in cursor.description]
+                    yield [dict(zip(columns, row)) for row in rows]
+                else:
+                    yield [
+                        tuple(serialize_if_needed(v) for v in row)
+                        for row in rows
+                    ]
 
         except Exception as exc:
             logger.error(f"Error streaming batch from Postgres table {table_name}: {exc}")
@@ -1133,10 +1144,11 @@ class PostgresConnector(SqlConnector):
             conn.close()
     
 
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]], columns: List[str]):
+    def insert_data(self, table_name: str, data: List[Any], columns: List[str]):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
+            logger.info(f"data: {data}")
             table_identifier = f'"{self.schema}"."{table_name}"'
             query = f"INSERT INTO {table_identifier} ({', '.join(columns)}) VALUES %s"
             execute_values(cursor, query, data)
@@ -1144,6 +1156,51 @@ class PostgresConnector(SqlConnector):
         except Exception as e:
             logger.error(f"Failed to insert data into {table_name}: {e}")
             conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+            conn.close()
+    
+
+    def upsert_data(self, table_name: str, data: List[Any], columns: List[str], pk_columns: List[str]):
+        """ 
+        Inserts data into a PostgreSQL table, or updates existing rows if a conflict 
+        occurs on the specified unique_columns.
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            table_identifier = f'"{self.schema}"."{table_name}"'
+            
+            # 1. Identify the columns that trigger a conflict (e.g., Primary Keys)
+            conflict_target = ', '.join(pk_columns)
+            
+            # 2. Identify the columns that should be updated (everything except the unique columns)
+            update_cols = [col for col in columns if col not in pk_columns]
+            
+            # 3. Build the conflict action (DO UPDATE SET ... or DO NOTHING if no update cols exist)
+            if update_cols:
+                # EXCLUDED is a special PostgreSQL table containing the rows proposed for insertion
+                set_clause = ', '.join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                conflict_action = f"DO UPDATE SET {set_clause}"
+            else:
+                conflict_action = "DO NOTHING"
+                
+            # 4. Construct the final query
+            query = f"""
+                INSERT INTO {table_identifier} ({', '.join(columns)}) 
+                VALUES %s 
+                ON CONFLICT ({conflict_target}) 
+                {conflict_action}
+            """
+            
+            execute_values(cursor, query, data)
+            conn.commit()
+            
+        except Exception as e:
+            logger.error(f"Failed to upsert data into {table_name}: {e}")
+            conn.rollback()
+            raise e
         finally:
             cursor.close()
             conn.close()

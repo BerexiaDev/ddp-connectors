@@ -202,25 +202,24 @@ class OracleConnector(SqlConnector):
                 outconverter=bfile_out_converter
             )
 
-    def stream_batch(self, table_name: str, batch_size: int = 10_000):
+    def stream_batch(self, cursor, table_name: str, batch_size: int = 10_000, **kwargs):
         """Streaming for Oracle using fetchmany. Oracle driver handles arraysize natively."""
-        conn = self.get_connection()
         try:
-            with conn.cursor() as cursor:
-                cursor.arraysize = batch_size
-                logger.info(f"Start streaming Oracle table {table_name} with batch_size={batch_size}")
-                cursor.execute(f"SELECT * FROM {self.schema}.{table_name}")
+            cursor.arraysize = batch_size
+            logger.info(f"Start streaming Oracle table {table_name} with batch_size={batch_size}")
+            cursor.execute(f"SELECT * FROM {self.schema}.{table_name}")
 
-                while True:
-                    rows = cursor.fetchmany(batch_size)
-                    if not rows:
-                        break
-                    yield rows
-                logger.info(f"Finished streaming Oracle table {table_name}")
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield rows
+            logger.info(f"Finished streaming Oracle table {table_name}")
         except Exception as exc:
             logger.error(f"Error streaming batch from Oracle table {table_name}: {exc}")
         finally:
-            conn.close()
+            if cursor:
+                cursor.close()
 
     def get_connection_tables(self):
         conn = self.get_connection()

@@ -77,7 +77,7 @@ class InformixConnector(SqlConnector):
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
             return []
 
-    def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000,):
+    def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000, **kwargs):
         """
         Full-sync streaming for Informix (no SKIP / OFFSET).
         Uses a single SELECT and fetchmany to avoid performance degradation.

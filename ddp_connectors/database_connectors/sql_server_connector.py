@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import pyodbc
 from loguru import logger
@@ -81,7 +81,7 @@ class SqlServerConnector(SqlConnector):
             logger.error(f"Error fetching batch from {table_name}: {exc}")
             return []
 
-    def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000):
+    def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000, **kwargs):
         """
         Full-sync streaming: sequentially fetch rows without OFFSET.
         Works best for reloads (truncate + reload). Not suitable for resume.
@@ -405,4 +405,83 @@ class SqlServerConnector(SqlConnector):
             return []
         finally:
             cur.close()
+            conn.close()
+
+    def insert_data(self, table_name: str, data: List[Union[Dict[str, Any], Tuple, List]], columns: List[str]) -> int:
+        """
+        Inserts data into a SQL Server table.
+        """
+        if not data:
+            logger.warning(f"No data provided to insert into {table_name}.")
+            return 0
+
+        placeholders = ", ".join(["?"] * len(columns))
+        cols_str = ", ".join([f'{col}' for col in columns])
+        query = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders})"
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.executemany(query, data)
+            conn.commit()
+            return cursor.rowcount
+        except Exception as e:
+            logger.error(f"Error inserting data into {table_name}: {e}")
+            conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def upsert_data(self, table_name: str, data: List[Union[Dict[str, Any], Tuple, List]], columns: List[str], pk_columns: List[str]) -> int:
+        if not data:
+            logger.warning(f"No data provided to upsert into {table_name}.")
+            return 0
+
+        if not pk_columns:
+            logger.error("Primary key columns must be provided for an upsert operation.")
+            raise ValueError("pk_columns cannot be empty for upsert.")
+
+        # 1. Build the USING clause
+        # SQL Server allows us to build a virtual source table using VALUES (?, ?, ...)
+        placeholders = ", ".join(["?"] * len(columns))
+        src_cols = ", ".join([f'[{col}]' for col in columns])
+        using_clause = f'USING (VALUES ({placeholders})) AS src({src_cols})'
+
+        # 2. Build the ON clause (defining the match condition)
+        on_conditions = " AND ".join([f'trg.[{pk}] = src.[{pk}]' for pk in pk_columns])
+        on_clause = f'ON ({on_conditions})'
+
+        # 3. Build the UPDATE clause
+        update_cols = [col for col in columns if col not in pk_columns]
+        if update_cols:
+            set_statements = ", ".join([f'trg.[{col}] = src.[{col}]' for col in update_cols])
+            update_clause = f'WHEN MATCHED THEN UPDATE SET {set_statements}'
+        else:
+            update_clause = ""
+
+        # 4. Build the INSERT clause
+        insert_cols_str = ", ".join([f'[{col}]' for col in columns])
+        values_str = ", ".join([f'src.[{col}]' for col in columns])
+        # IMPORTANT: SQL Server MERGE statements MUST be terminated with a semicolon!
+        insert_clause = f'WHEN NOT MATCHED THEN INSERT ({insert_cols_str}) VALUES ({values_str});'
+
+        # 5. Assemble the final MERGE query
+        query = f'MERGE {table_name} AS trg \n{using_clause} \n{on_clause} \n{update_clause} \n{insert_clause}'
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.executemany(query, data)
+            conn.commit()
+            
+            upserted_count = cursor.rowcount
+            return upserted_count
+                
+        except Exception as exc:
+            conn.rollback()
+            logger.error(f"Error upserting data into {table_name}: {exc}")
+            raise exc
+        finally:
+            cursor.close()
             conn.close()

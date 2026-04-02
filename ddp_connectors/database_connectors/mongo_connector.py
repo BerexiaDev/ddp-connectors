@@ -179,7 +179,7 @@ class MongoConnector:
         finally:
             client.close()
 
-    def stream_batch(self, table_name: str, batch_size: int = 10_000):
+    def stream_batch(self, cursor, table_name: str, batch_size: int = 10_000, **kwargs):
         """
         Streaming for MongoDB using a cursor.
         If as_dict=True, yields batches of raw dictionaries.
