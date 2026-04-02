@@ -3,11 +3,13 @@ from datetime import datetime
 from itertools import islice
 import json
 from loguru import logger
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from pymongo import MongoClient
 
 from bson.decimal128 import Decimal128
 from bson.codec_options import TypeCodec, TypeRegistry, CodecOptions
+from pymongo import UpdateOne
+from pymongo.errors import BulkWriteError
 from decimal import Decimal
 
 class DecimalCodec(TypeCodec):
@@ -63,7 +65,7 @@ class MongoConnector:
             
         return MongoClient(uri)
 
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]], columns: List[str] = None) -> int:
+    def insert_data(self, table_name: str, data: List[Any], columns: List[str] = None) -> int:
         """
         Inserts a list of dictionaries into the specified MongoDB collection using insert_many.
         """
@@ -85,6 +87,71 @@ class MongoConnector:
             
         except Exception as exc:
             logger.error(f"Error inserting data into {table_name}: {exc}")
+            raise
+            
+        finally:
+            client.close()
+            
+
+    def upsert_data(self, table_name: str, data: List[Any], columns: Optional[List[str]] = None, pk_columns: Optional[List[str]] = None) -> int:
+        """
+        Upserts a list of dictionaries into the specified MongoDB collection using bulk_write.
+        """
+        if not data:
+            logger.warning(f"No data provided to upsert into {table_name}.")
+            return 0
+
+        # Default to MongoDB's standard primary key if none is provided
+        if not pk_columns:
+            pk_columns = ["_id"]
+
+        client = self.get_connection()
+        
+        try:
+            db = client[self.database_name]
+            # Assuming codec_options is defined on your class or imported
+            collection = db.get_collection(table_name, codec_options=codec_options)
+
+            # 1. Build a list of UpdateOne operations
+            operations = []
+            for row in data:
+                # Dynamically build the match filter based on the primary keys
+                filter_query = {pk: row.get(pk) for pk in pk_columns if pk in row}
+                
+                # Skip rows that don't have the required primary keys to avoid accidental mass-updates
+                if not filter_query:
+                    logger.warning(f"Row missing primary key(s) {pk_columns}. Skipping row.")
+                    continue
+
+                # 2. Append the upsert operation using $set
+                operations.append(
+                    UpdateOne(
+                        filter=filter_query,
+                        update={"$set": row},
+                        upsert=True
+                    )
+                )
+
+            if not operations:
+                logger.warning(f"No valid operations to execute for {table_name}.")
+                return 0
+
+            # 3. Execute the bulk write
+            # ordered=False allows MongoDB to process all operations even if some fail
+            result = collection.bulk_write(operations, ordered=False)
+            
+            # In MongoDB, an upsert operation either 'upserts' (inserts new) or 'modifies' (updates existing)
+            total_success = result.upserted_count + result.modified_count
+            
+            logger.info(f"Successfully upserted/modified {total_success} documents in {table_name}.")
+            return total_success
+
+        except BulkWriteError as bwe:
+            # BulkWriteError gives us a detailed payload of exactly which documents failed and why
+            logger.error(f"Bulk write error while upserting data into {table_name}: {bwe.details}")
+            raise
+        except Exception as exc:
+            logger.error(f"Error upserting data into {table_name}: {exc}")
             raise
             
         finally:
