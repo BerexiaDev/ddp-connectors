@@ -70,7 +70,7 @@ class OracleConnector(SqlConnector):
         return conn
 
     
-    def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
+    def insert_data(self, table_name: str, data: List[Any], columns: List[str]) -> int:
         """
         Inserts a list of dictionaries into the specified Oracle table using executemany.
         
@@ -84,9 +84,6 @@ class OracleConnector(SqlConnector):
         if not data:
             logger.warning(f"No data provided to insert into {table_name}.")
             return 0
-
-        # 1. Extract column names from the first dictionary
-        columns = list(data[0].keys())
         
         # 2. Build the parameterized SQL statement
         col_names_str = ", ".join([f'"{col}"' for col in columns])
@@ -96,30 +93,81 @@ class OracleConnector(SqlConnector):
         schema_prefix = f'"{self.schema}".' if getattr(self, 'schema', None) and self.schema.lower() != 'public' else ""
         query = f'INSERT INTO {schema_prefix}"{table_name}" ({col_names_str}) VALUES ({bind_vars_str})'
 
-        # 3. Convert List[Dict] to List[Tuple] matching the column order
-        optimized_data = [
-            tuple(serialize_if_needed(val) for val in row)
-            for row in data
-        ]
-
         conn = self.get_connection()
-        
+
+        cursor = conn.cursor()
         try:
-            with conn.cursor() as cursor:
-                cursor.executemany(query, optimized_data)
-                conn.commit()
-                
-                inserted_count = cursor.rowcount
-                logger.info(f"Successfully inserted {inserted_count} rows into {table_name}.")
-                
-                return inserted_count
-                
+            cursor.executemany(query, data)
+            conn.commit()
+            return cursor.rowcount
         except Exception as exc:
             conn.rollback()
             logger.error(f"Error inserting data into {table_name}: {exc}")
             raise
             
         finally:
+            cursor.close()
+            conn.close()
+
+    def upsert_data(self, table_name: str, data: List[Any], columns: List[str], pk_columns: List[str]) -> int:
+        """
+        Upserts a list of dictionaries into the specified Oracle table using MERGE INTO.
+            
+        Returns:
+            int: The total number of rows successfully upserted.
+        """
+        if not data:
+            logger.warning(f"No data provided to upsert into {table_name}.")
+            return 0
+
+        if not pk_columns:
+            logger.error("Primary key columns must be provided for an upsert operation.")
+            raise ValueError("pk_columns cannot be empty for upsert.")
+
+        # 1. Safely handle the schema
+        schema_prefix = f'"{self.schema}".' if getattr(self, 'schema', None) and self.schema.lower() != 'public' else ""
+        target_table = f'{schema_prefix}"{table_name}"'
+
+        # 2. Build the USING clause (mapping bind variables to column names in a dual select)
+        # This prevents us from having to repeat bind variables in the query string
+        select_cols = ", ".join([f":{i+1} AS \"{col}\"" for i, col in enumerate(columns)])
+        using_clause = f'USING (SELECT {select_cols} FROM dual) src'
+
+        # 3. Build the ON clause (defining the match condition)
+        on_conditions = " AND ".join([f'trg."{pk}" = src."{pk}"' for pk in pk_columns])
+        on_clause = f'ON ({on_conditions})'
+
+        # 4. Build the UPDATE clause (only update non-PK columns)
+        update_cols = [col for col in columns if col not in pk_columns]
+        if update_cols:
+            set_statements = ", ".join([f'trg."{col}" = src."{col}"' for col in update_cols])
+            update_clause = f'WHEN MATCHED THEN UPDATE SET {set_statements}'
+        else:
+            # If the table only consists of primary keys, there is nothing to update
+            update_clause = ""
+
+        # 5. Build the INSERT clause
+        insert_cols_str = ", ".join([f'"{col}"' for col in columns])
+        values_str = ", ".join([f'src."{col}"' for col in columns])
+        insert_clause = f'WHEN NOT MATCHED THEN INSERT ({insert_cols_str}) VALUES ({values_str})'
+
+        # 6. Assemble the final MERGE query
+        query = f'MERGE INTO {target_table} trg \n{using_clause} \n{on_clause} \n{update_clause} \n{insert_clause}'
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.executemany(query, data)
+            conn.commit()
+            return cursor.rowcount
+        except Exception as exc:
+            conn.rollback()
+            logger.error(f"Error upserting data into {table_name}: {exc}")
+            raise exc
+            
+        finally:
+            cursor.close()
             conn.close()
 
     def fetch_batch(self, cursor, table_name, offset: int, limit: int = 100):
