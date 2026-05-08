@@ -28,6 +28,42 @@ def safe_convert_to_string(value):
         return None
 
 
+def normalize_ui_column_type(data_type: str) -> str:
+    """
+    Normalize connector-specific types into the small UI-facing type vocabulary.
+    """
+    normalized = (data_type or "").strip()
+    lowered = normalized.lower()
+
+    canonical = {
+        "string": "string",
+        "number": "number",
+        "boolean": "boolean",
+        "date": "Date",
+        "datetime": "Datetime",
+        "list": "list",
+        "record": "record",
+        "set": "set",
+        "multiset": "multiset",
+        "string[]": "list",
+        "any[]": "list",
+        "record<string, any>": "record",
+        "record<string,any>": "record",
+        "binary": "string",
+        "null": "string",
+        "unknown": "string",
+        "any": "record",
+    }
+
+    if lowered in canonical:
+        return canonical[lowered]
+
+    if lowered.endswith("[]"):
+        return "list"
+
+    return normalized if normalized in {"Date", "Datetime"} else "string"
+
+
 def cast_sql_to_typescript_types(sa_type):
     # String types
     if isinstance(sa_type, (sqlalchemy.String, sqlalchemy.Unicode, sqlalchemy.Text,
@@ -248,9 +284,10 @@ def cast_postgres_to_typescript(data_type: str) -> str:
         "json": "any",
         "jsonb": "any",
         "uuid": "string",
+        "array": "list",
     }
 
-    if data_type == "USER-DEFINED":
+    if data_type == "user-defined":
         return "string"
 
     return mapping.get(data_type, "any")

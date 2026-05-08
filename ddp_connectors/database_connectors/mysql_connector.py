@@ -6,12 +6,13 @@ import mysql.connector
 from datetime import datetime
 
 from loguru import logger
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 from .sql_connector import SqlConnector
 from .sql_connector_utils import (
     cast_mysql_to_typescript_types,
     cast_mysql_to_postgresql_type,
+    normalize_ui_column_type,
     safe_convert_to_string,
 )
 
@@ -33,6 +34,22 @@ class MySQLConnector(SqlConnector):
             "use_pure": True,
         }
         return mysql.connector.connect(**conn_params)
+
+    def get_default_schema(self) -> Optional[str]:
+        return self.database
+
+    def _quote_identifier(self, identifier: str) -> str:
+        normalized = self._normalize_identifier(identifier) or ""
+        return f"`{normalized.replace('`', '``')}`"
+
+    def _qualify_table_sql(self, table_name: str, schema: Optional[str] = None) -> str:
+        resolved_schema, resolved_table = self.resolve_schema_and_table(table_name, schema)
+        if resolved_schema:
+            return f"{self._quote_identifier(resolved_schema)}.{self._quote_identifier(resolved_table)}"
+        return self._quote_identifier(resolved_table)
+
+    def get_connection_schemas(self) -> List[str]:
+        return [self.database]
 
     def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
         """Parse filters payload into a safe WHERE clause and parameters."""
@@ -137,14 +154,15 @@ class MySQLConnector(SqlConnector):
         where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where_clause, params
 
-    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None) -> List[Dict[str, Any]]:
+    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         where_clause, params = self._build_filters_clause(filters)
+        qualified_table = self._qualify_table_sql(table_name, schema)
         query = (
-            f"SELECT * FROM `{table_name}`"
+            f"SELECT * FROM {qualified_table}"
             f"{where_clause} "
             f"LIMIT {limit} OFFSET {offset};"
         )
-        logger.info(f"Fetching batch: table={table_name}, offset={offset}, limit={limit}, filters_applied={bool(where_clause.strip())}")
+        logger.info(f"Fetching batch: table={qualified_table}, offset={offset}, limit={limit}, filters_applied={bool(where_clause.strip())}")
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -161,50 +179,64 @@ class MySQLConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def fetch_batch(self, cursor, table_name, offset: int, limit: int = 100):
+    def fetch_batch(self, cursor, table_name, offset: int, batch_size: int = 100, schema: Optional[str] = None, **kwargs):
         try:
-            query = f"SELECT * FROM `{table_name}` LIMIT {limit} OFFSET {offset}"
+            limit = kwargs.get("limit", batch_size)
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            query = f"SELECT * FROM {qualified_table} LIMIT {limit} OFFSET {offset}"
             cursor.execute(query)
             return cursor.fetchall()
         except Exception as e:
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
             return []
 
-    def stream_batch(self, table_name: str, batch_size: int = 10_000):
+    def stream_batch(self, cursor=None, table_name: Optional[str] = None, batch_size: int = 10_000, schema: Optional[str] = None):
         """
         Full-sync streaming for MySQL using a server-side cursor (SSCursor).
         Avoids OFFSET and prevents loading the full result set into memory.
         """
         conn = None
-        cursor = None
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor(buffered=False)
+        managed_cursor = None
+        if table_name is None and isinstance(cursor, str):
+            table_name = cursor
+            cursor = None
 
-            logger.info(f"Start streaming MySQL table {table_name} with batch_size={batch_size}")
-            cursor.execute(f"SELECT * FROM `{table_name}`")
+        if not table_name:
+            raise ValueError("table_name is required")
+
+        qualified_table = self._qualify_table_sql(table_name, schema)
+        try:
+            if cursor is None:
+                conn = self.get_connection()
+                managed_cursor = conn.cursor(buffered=False)
+            else:
+                managed_cursor = cursor
+
+            logger.info(f"Start streaming MySQL table {qualified_table} with batch_size={batch_size}")
+            managed_cursor.execute(f"SELECT * FROM {qualified_table}")
 
             while True:
-                rows = cursor.fetchmany(batch_size)
+                rows = managed_cursor.fetchmany(batch_size)
                 if not rows:
                     break
                 yield rows
 
-            logger.info(f"Finished streaming MySQL table {table_name}")
+            logger.info(f"Finished streaming MySQL table {qualified_table}")
 
         except Exception as exc:
             logger.error(f"Error streaming batch from MySQL table {table_name}: {exc}")
             return
 
         finally:
-            if cursor:
-                cursor.close()
+            if managed_cursor and conn:
+                managed_cursor.close()
             if conn:
                 conn.close()
 
-    def get_connection_tables(self):
+    def get_connection_tables(self, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema = self._normalize_identifier(schema) or self.database
         try:
             cursor.execute(
                 """
@@ -213,7 +245,7 @@ class MySQLConnector(SqlConnector):
                 WHERE table_schema = %s
                   AND table_type = 'BASE TABLE';
                 """,
-                (self.database,),
+                (target_schema,),
             )
             return [row[0] for row in cursor.fetchall()]
         except Exception as e:
@@ -223,9 +255,10 @@ class MySQLConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def get_connection_columns(self, table_name: str):
+    def get_connection_columns(self, table_name: str, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             cursor.execute(
                 """
@@ -235,14 +268,19 @@ class MySQLConnector(SqlConnector):
                   AND table_name = %s
                 ORDER BY ordinal_position;
                 """,
-                (self.database, table_name),
+                (target_schema, pure_table),
             )
             rows = cursor.fetchall()
 
-            columns: list[dict[str, str]] = []
+            columns: List[Dict[str, str]] = []
             for column_name, data_type in rows:
-                ts_type = cast_mysql_to_typescript_types(data_type)
-                columns.append({"name": column_name, "type": ts_type, "alias": column_name})
+                ts_type = normalize_ui_column_type(cast_mysql_to_typescript_types(data_type))
+                columns.append({
+                    "name": column_name,
+                    "type": ts_type,
+                    "alias": column_name,
+                    "classification": "",
+                })
             return columns
         except Exception as e:
             logger.error(f"Error getting columns: {e}")
@@ -251,12 +289,14 @@ class MySQLConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def count_table_rows(self, table_name: str, filters=None) -> int:
+    def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
+        schema, filters = self.coerce_schema_and_filters(schema, filters)
         where_clause, params = self._build_filters_clause(filters)
+        qualified_table = self._qualify_table_sql(table_name, schema)
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`{where_clause}", params)
+            cursor.execute(f"SELECT COUNT(*) FROM {qualified_table}{where_clause}", params)
             count_result = cursor.fetchone()
             return int(count_result[0]) if count_result else 0
         except Exception as e:
@@ -266,14 +306,15 @@ class MySQLConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def get_min_max_date(self, table_name: str, column_name: str):
+    def get_min_max_date(self, table_name: str, column_name: str, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        qualified_table = self._qualify_table_sql(table_name, schema)
         try:
             sql = (
-                f"SELECT MIN(`{column_name}`), MAX(`{column_name}`) "
-                f"FROM `{table_name}` "
-                f"WHERE `{column_name}` IS NOT NULL;"
+                f"SELECT MIN({self._quote_identifier(column_name)}), MAX({self._quote_identifier(column_name)}) "
+                f"FROM {qualified_table} "
+                f"WHERE {self._quote_identifier(column_name)} IS NOT NULL;"
             )
             cursor.execute(sql)
             row = cursor.fetchone()
@@ -282,9 +323,10 @@ class MySQLConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def extract_table_schema(self, table_name):
+    def extract_table_schema(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             schema_sql = """
                 SELECT
@@ -321,7 +363,7 @@ class MySQLConnector(SqlConnector):
                 ORDER BY c.ORDINAL_POSITION;
             """
 
-            cursor.execute(schema_sql, (self.database, table_name))
+            cursor.execute(schema_sql, (target_schema, pure_table))
             rows = cursor.fetchall()
 
             seen = set()
@@ -353,19 +395,31 @@ class MySQLConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def fetch_deltas(self, cursor, primary_key: str, log_table: str, since_ts: datetime, batch_size: int = 10_000):
+    def fetch_deltas(self, cursor, primary_keys, log_table: str, since_ts: datetime, batch_size: int = 10_000, schema: Optional[str] = None):
+        primary_keys = self.normalize_primary_keys(primary_keys)
+        qualified_log_table = self._qualify_table_sql(log_table, schema)
+        if not primary_keys:
+            logger.error("fetch_deltas requires at least one primary key column.")
+            return
+
+        pk_select = ", ".join(self._quote_identifier(pk) for pk in primary_keys)
+        pk_join = " AND ".join(
+            f"t.{self._quote_identifier(pk)} = latest.{self._quote_identifier(pk)}"
+            for pk in primary_keys
+        )
+        pk_order = ", ".join(f"t.{self._quote_identifier(pk)}" for pk in primary_keys)
         sql = f"""
             SELECT t.*
-            FROM `{log_table}` t
+            FROM {qualified_log_table} t
             INNER JOIN (
-                SELECT `{primary_key}`, MAX(`Date_operation`) AS max_op
-                FROM `{log_table}`
+                SELECT {pk_select}, MAX(`Date_operation`) AS max_op
+                FROM {qualified_log_table}
                 WHERE `Date_operation` > %s
-                GROUP BY `{primary_key}`
+                GROUP BY {pk_select}
             ) latest
-            ON t.`{primary_key}` = latest.`{primary_key}`
+            ON {pk_join}
             AND t.`Date_operation` = latest.max_op
-            ORDER BY t.`{primary_key}`
+            ORDER BY {pk_order}
             LIMIT %s OFFSET %s;
         """
         offset = 0
@@ -381,15 +435,16 @@ class MySQLConnector(SqlConnector):
 
             offset += batch_size
 
-    def truncate_table(self, table_name: str) -> bool:
+    def truncate_table(self, table_name: str, schema: Optional[str] = None) -> bool:
         conn = None
         cursor = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-            cursor.execute(f"TRUNCATE TABLE `{table_name}`")
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            cursor.execute(f"TRUNCATE TABLE {qualified_table}")
             conn.commit()
-            logger.info(f"Successfully truncated table: {table_name}")
+            logger.info(f"Successfully truncated table: {qualified_table}")
             return True
         except Exception as e:
             logger.error(f"Failed to truncate table {table_name}: {str(e)}")
@@ -402,7 +457,7 @@ class MySQLConnector(SqlConnector):
             if conn:
                 conn.close()
 
-    def get_table_indexes(self, table_name: str) -> List[Dict[str, Any]]:
+    def get_table_indexes(self, table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Return index definitions for a MySQL table.
 
@@ -414,6 +469,7 @@ class MySQLConnector(SqlConnector):
         """
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             cursor.execute(
                 """
@@ -427,7 +483,7 @@ class MySQLConnector(SqlConnector):
                 GROUP BY INDEX_NAME, NON_UNIQUE
                 ORDER BY INDEX_NAME;
                 """,
-                (self.database, table_name),
+                (target_schema, pure_table),
             )
             rows = cursor.fetchall()
 

@@ -1,12 +1,12 @@
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pyodbc
 from loguru import logger
 
 from .sql_connector import SqlConnector
 from .sql_connector_utils import safe_convert_to_string, cast_sqlserver_to_typescript_types, \
-    cast_sqlserver_to_postgresql_type
+    cast_sqlserver_to_postgresql_type, normalize_ui_column_type
 
 
 class SqlServerConnector(SqlConnector):
@@ -14,6 +14,7 @@ class SqlServerConnector(SqlConnector):
     def __init__(self, host, user, password, port, database):
         super().__init__(host, user, password, port, database)
         self.driver = "ODBC Driver 17 for SQL Server"
+        self.schema = "dbo"
 
     def get_connection(self):
         """Returns a pyodbc connection object directly."""
@@ -43,15 +44,59 @@ class SqlServerConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100) -> List[dict]:
+    def _quote_identifier(self, identifier: str) -> str:
+        normalized = self._normalize_identifier(identifier) or ""
+        return f"[{normalized.replace(']', ']]')}]"
+
+    def _qualify_table_sql(self, table_name: str, schema: Optional[str] = None) -> str:
+        resolved_schema, resolved_table = self.resolve_schema_and_table(table_name, schema)
+        if resolved_schema:
+            return f"{self._quote_identifier(resolved_schema)}.{self._quote_identifier(resolved_table)}"
+        return self._quote_identifier(resolved_table)
+
+    def get_connection_schemas(self) -> List[str]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT name
+                FROM sys.schemas
+                WHERE name NOT IN (
+                    'sys',
+                    'INFORMATION_SCHEMA',
+                    'guest',
+                    'db_owner',
+                    'db_accessadmin',
+                    'db_securityadmin',
+                    'db_ddladmin',
+                    'db_backupoperator',
+                    'db_datareader',
+                    'db_datawriter',
+                    'db_denydatareader',
+                    'db_denydatawriter'
+                )
+                ORDER BY name;
+                """
+            )
+            return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting schemas: {e}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
+
+    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None, schema: Optional[str] = None) -> List[dict]:
+        qualified_table = self._qualify_table_sql(table_name, schema)
         query = (
             f"SELECT * "
-            f"FROM {table_name} "
+            f"FROM {qualified_table} "
             f"ORDER BY (SELECT NULL) "
             f"OFFSET {offset} ROWS "
             f"FETCH NEXT {limit} ROWS ONLY;"
         )
-        logger.info(f"Fetching batch: table={table_name}, offset={offset}, limit={limit}")
+        logger.info(f"Fetching batch: table={qualified_table}, offset={offset}, limit={limit}")
         conn = self.get_connection()
         cur = conn.cursor()
         try:
@@ -68,10 +113,12 @@ class SqlServerConnector(SqlConnector):
             cur.close()
             conn.close()
 
-    def fetch_batch(self, cursor: pyodbc.Cursor, table_name: str, offset: int, limit: int = 100):
+    def fetch_batch(self, cursor: pyodbc.Cursor, table_name: str, offset: int, batch_size: int = 100, schema: Optional[str] = None, **kwargs):
         try:
+            limit = kwargs.get("limit", batch_size)
+            qualified_table = self._qualify_table_sql(table_name, schema)
             query = (
-                f"SELECT * FROM {table_name} "
+                f"SELECT * FROM {qualified_table} "
                 f"ORDER BY (SELECT NULL) "
                 f"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY;"
             )
@@ -81,14 +128,15 @@ class SqlServerConnector(SqlConnector):
             logger.error(f"Error fetching batch from {table_name}: {exc}")
             return []
 
-    def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000):
+    def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000, schema: Optional[str] = None):
         """
         Full-sync streaming: sequentially fetch rows without OFFSET.
         Works best for reloads (truncate + reload). Not suitable for resume.
         """
         try:
             cursor.arraysize = batch_size
-            cursor.execute(f"SELECT * FROM {table_name};")
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            cursor.execute(f"SELECT * FROM {qualified_table};")
     
             while True:
                 rows = cursor.fetchmany(batch_size)
@@ -101,16 +149,19 @@ class SqlServerConnector(SqlConnector):
             return
 
 
-    def get_connection_tables(self):
+    def get_connection_tables(self, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema = self._normalize_identifier(schema) or self.schema
         sql = """
-                SELECT  t.name
+                SELECT t.name
                 FROM sys.tables t
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
                 WHERE t.is_ms_shipped = 0
+                  AND s.name = ?
             """
         try:
-            cursor.execute(sql)
+            cursor.execute(sql, target_schema)
             tables = [row.name for row in cursor.fetchall()]
             return tables
         except Exception as e:
@@ -120,20 +171,30 @@ class SqlServerConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def get_connection_columns(self, table_name):
+    def get_connection_columns(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             sql = """
                     SELECT column_name, data_type
                     FROM INFORMATION_SCHEMA.COLUMNS
-                    WHERE table_name   = ?;
+                    WHERE table_schema = ?
+                      AND table_name   = ?
+                    ORDER BY ordinal_position;
               """
-            cursor.execute(sql, table_name)
+            cursor.execute(sql, target_schema, pure_table)
             rows = cursor.fetchall()
 
-            columns = [{'name': row.column_name, 'type': cast_sqlserver_to_typescript_types(row.data_type)} for row in
-                       rows]
+            columns = [
+                {
+                    "name": row.column_name,
+                    "type": normalize_ui_column_type(cast_sqlserver_to_typescript_types(row.data_type)),
+                    "alias": row.column_name,
+                    "classification": "",
+                }
+                for row in rows
+            ]
             return columns
         except Exception as e:
             logger.error(f"Error getting columns: {e}")
@@ -142,11 +203,13 @@ class SqlServerConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def count_table_rows(self, table_name: str) -> int:
+    def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
+        schema, _ = self.coerce_schema_and_filters(schema, filters)
+        qualified_table = self._qualify_table_sql(table_name, schema)
         connection = self.get_connection()
         cursor = connection.cursor()
         try:
-            count_result = cursor.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+            count_result = cursor.execute(f"SELECT COUNT(*) FROM {qualified_table}").fetchone()
             total_count = int(count_result[0]) if count_result else 0
             return total_count
         except Exception as e:
@@ -156,18 +219,19 @@ class SqlServerConnector(SqlConnector):
             cursor.close()
             connection.close()
 
-    def get_min_max_date(self, table_name: str, column_name: str):
+    def get_min_max_date(self, table_name: str, column_name: str, schema: Optional[str] = None):
         """
         Returns (min_value, max_value) for a DATE/DATETIME column in SQL Server.
         """
         conn = self.get_connection()
         cur = conn.cursor()
+        qualified_table = self._qualify_table_sql(table_name, schema)
         try:
             sql = f"""
                 SELECT
                     MIN([{column_name}]) AS min_val,
                     MAX([{column_name}]) AS max_val
-                FROM [{table_name}]
+                FROM {qualified_table}
                 WHERE [{column_name}] IS NOT NULL;
             """
             cur.execute(sql)
@@ -177,9 +241,10 @@ class SqlServerConnector(SqlConnector):
             cur.close()
             conn.close()
 
-    def extract_table_schema(self, table_name):
+    def extract_table_schema(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        qualified_table = self.qualify_table_name(table_name, schema)
         try:
             schema_sql = """
                     WITH pk_cols AS (
@@ -220,7 +285,7 @@ class SqlServerConnector(SqlConnector):
                     ORDER BY col.column_id;
                 """
 
-            rows = cursor.execute(schema_sql, table_name, table_name, table_name, table_name).fetchall()
+            rows = cursor.execute(schema_sql, qualified_table, qualified_table, qualified_table, qualified_table).fetchall()
             result = []
             seen = set()
             for row in rows:
@@ -277,16 +342,23 @@ class SqlServerConnector(SqlConnector):
     def fetch_deltas(
         self,
         cursor,
-        primary_keys: List[str],
+        primary_keys,
         log_table: str,
         since_ts: datetime,
         batch_size: int = 10_000,
+        schema: Optional[str] = None,
     ):
+        primary_keys = self.normalize_primary_keys(primary_keys)
+        qualified_log_table = self._qualify_table_sql(log_table, schema)
+        if not primary_keys:
+            logger.error("fetch_deltas requires at least one primary key column.")
+            return
+
         # Build composite expressions
-        pk_cols = ", ".join(primary_keys)                          # ex: "siren, code"
+        pk_cols = ", ".join(self._quote_identifier(pk) for pk in primary_keys)
         partition_expr = pk_cols                                   # PARTITION BY siren, code
         order_expr = "Date_operation DESC"                         # always the same
-        order_by_final = ", ".join(primary_keys)                   # ORDER BY siren, code
+        order_by_final = pk_cols
 
         sql = f"""
             SELECT *
@@ -296,7 +368,7 @@ class SqlServerConnector(SqlConnector):
                         PARTITION BY {partition_expr}
                         ORDER BY {order_expr}
                     ) AS rn
-                FROM {log_table}
+                FROM {qualified_log_table}
                 WHERE Date_operation > ?
             ) AS ranked
             WHERE rn = 1
@@ -318,7 +390,7 @@ class SqlServerConnector(SqlConnector):
 
             offset += batch_size
 
-    def get_table_indexes(self, table_name: str) -> List[Dict[str, Any]]:
+    def get_table_indexes(self, table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Return index definitions for a table from SQL Server catalogs.
 
@@ -333,16 +405,8 @@ class SqlServerConnector(SqlConnector):
         ]
         """
 
-        def _split_schema_table(t: str) -> Tuple[str, str]:
-            t = (t or "").strip()
-            # allow [dbo].[agent] style too
-            t = t.replace("[", "").replace("]", "")
-            if "." in t:
-                s, tb = t.split(".", 1)
-                return s.strip(), tb.strip()
-            return "dbo", t.strip()
-
-        schema_name, pure_table = _split_schema_table(table_name)
+        schema_name, pure_table = self.resolve_schema_and_table(table_name, schema)
+        schema_name = schema_name or self.schema
 
         conn = self.get_connection()
         cur = conn.cursor()
