@@ -147,7 +147,7 @@ class InformixConnector(SqlConnector):
                       AND owner = ?
                     ORDER BY tabname
                     """,
-                    target_schema,
+                    (target_schema,),
                 )
             else:
                 cursor.execute(
@@ -159,10 +159,10 @@ class InformixConnector(SqlConnector):
                     ORDER BY tabname
                     """
                 )
-            tables = [row.tabname for row in cursor.fetchall()]
+            tables = [row[0] for row in cursor.fetchall()]
             return tables
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(f"Error getting tables for schema '{target_schema}': {e}")
             return []
         finally:
             cursor.close()
