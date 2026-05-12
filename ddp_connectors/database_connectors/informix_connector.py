@@ -198,33 +198,63 @@ class InformixConnector(SqlConnector):
         target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             query = """
-                SELECT colname, coltype 
-                FROM syscolumns
-                WHERE tabid = (
-                    SELECT FIRST 1 tabid
-                    FROM systables
-                    WHERE tabname = ?
+                SELECT c.colname, c.coltype
+                FROM informix.syscolumns c
+                JOIN informix.systables t ON c.tabid = t.tabid
+                WHERE t.tabname = ?
             """
             params: List[Any] = [pure_table]
             if target_schema:
-                query += " AND owner = ?"
+                query += " AND t.owner = ?"
                 params.append(target_schema)
-            query += " ) ORDER BY colno"
-            cursor.execute(query, params)
+            query += " ORDER BY c.colno"
+
+            try:
+                logger.debug(
+                    f"[informix][column_discovery] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns/informix.systables parameter_binding=tuple"
+                )
+                cursor.execute(query, tuple(params))
+            except Exception:
+                safe_table = pure_table.replace("'", "''")
+                if target_schema:
+                    safe_schema = target_schema.replace("'", "''")
+                    query = f"""
+                        SELECT c.colname, c.coltype
+                        FROM informix.syscolumns c
+                        JOIN informix.systables t ON c.tabid = t.tabid
+                        WHERE t.tabname = '{safe_table}'
+                          AND t.owner = '{safe_schema}'
+                        ORDER BY c.colno
+                    """
+                else:
+                    query = f"""
+                        SELECT c.colname, c.coltype
+                        FROM informix.syscolumns c
+                        JOIN informix.systables t ON c.tabid = t.tabid
+                        WHERE t.tabname = '{safe_table}'
+                        ORDER BY c.colno
+                    """
+                logger.debug(
+                    f"[informix][column_discovery] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns/informix.systables fallback=escaped_literal"
+                )
+                cursor.execute(query)
+
             rows = cursor.fetchall()
 
             columns = [
                 {
-                    "name": row.colname,
-                    "type": normalize_ui_column_type(cast_informix_to_typescript_types(row.coltype)),
-                    "alias": row.colname,
+                    "name": row[0],
+                    "type": normalize_ui_column_type(cast_informix_to_typescript_types(row[1])),
+                    "alias": row[0],
                     "classification": "",
                 }
                 for row in rows
             ]
             return columns
         except Exception as e:
-            logger.error(f"Error getting columns: {e}")
+            logger.error(
+                f"[informix][column_discovery] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns/informix.systables failed: {e}"
+            )
             return []
         finally:
             cursor.close()
