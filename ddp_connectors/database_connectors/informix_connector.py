@@ -385,8 +385,8 @@ class InformixConnector(SqlConnector):
                 CASE
                     WHEN EXISTS (
                         SELECT 1
-                        FROM   sysconstraints sc
-                        JOIN   sysindexes     si ON sc.idxname = si.idxname
+                        FROM   informix.sysconstraints sc
+                        JOIN   informix.sysindexes     si ON sc.idxname = si.idxname
                         WHERE  sc.constrtype = 'P'
                           AND  sc.tabid     = c.tabid
                           AND  (c.colno = si.part1 OR c.colno = si.part2 OR c.colno = si.part3
@@ -401,9 +401,9 @@ class InformixConnector(SqlConnector):
                 CASE
                     WHEN EXISTS (
                         SELECT 1
-                        FROM   sysconstraints sc
-                        JOIN   sysreferences  sr ON sc.constrid = sr.constrid
-                        JOIN   sysindexes     si ON sc.idxname  = si.idxname
+                        FROM   informix.sysconstraints sc
+                        JOIN   informix.sysreferences  sr ON sc.constrid = sr.constrid
+                        JOIN   informix.sysindexes     si ON sc.idxname  = si.idxname
                         WHERE  sc.constrtype = 'R'
                           AND  sc.tabid      = c.tabid
                           AND  (c.colno = si.part1 OR c.colno = si.part2 OR c.colno = si.part3
@@ -419,7 +419,7 @@ class InformixConnector(SqlConnector):
                 CASE
                     WHEN EXISTS (
                         SELECT 1
-                        FROM   sysindexes si
+                        FROM   informix.sysindexes si
                         WHERE  si.tabid = c.tabid
                           AND  (c.colno = si.part1 OR c.colno = si.part2 OR c.colno = si.part3
                                 OR c.colno = si.part4 OR c.colno = si.part5 OR c.colno = si.part6
@@ -432,9 +432,9 @@ class InformixConnector(SqlConnector):
 
 
                 d.default                                 AS default_value
-            FROM   syscolumns   c
-            JOIN   systables    t ON c.tabid = t.tabid
-            LEFT   JOIN sysdefaults d ON c.tabid = d.tabid AND c.colno = d.colno
+            FROM   informix.syscolumns   c
+            JOIN   informix.systables    t ON c.tabid = t.tabid
+            LEFT   JOIN informix.sysdefaults d ON c.tabid = d.tabid AND c.colno = d.colno
             WHERE  t.tabname = ?
             """
             params: List[Any] = [pure_table]
@@ -442,7 +442,23 @@ class InformixConnector(SqlConnector):
                 query += " AND t.owner = ?"
                 params.append(target_schema)
             query += " ORDER BY c.colno"
-            cursor.execute(query, params)
+
+            try:
+                logger.debug(
+                    f"[informix][extract_table_schema] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix catalog tables parameter_binding=tuple"
+                )
+                cursor.execute(query, tuple(params))
+            except Exception:
+                safe_table = pure_table.replace("'", "''")
+                fallback_query = query.replace("?", f"'{safe_table}'", 1)
+                if target_schema:
+                    safe_owner = target_schema.replace("'", "''")
+                    fallback_query = fallback_query.replace("?", f"'{safe_owner}'", 1)
+                logger.debug(
+                    f"[informix][extract_table_schema] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix catalog tables fallback=escaped_literal"
+                )
+                cursor.execute(fallback_query)
+
             rows = cursor.fetchall()
 
             columns = [
@@ -462,7 +478,9 @@ class InformixConnector(SqlConnector):
             return columns
         
         except Exception as e:
-            logger.error(f"Error getting database schema: {str(e)}")
+            logger.error(
+                f"[informix][extract_table_schema] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix catalog tables failed: {str(e)}"
+            )
             return []
         finally:
             cursor.close()
@@ -542,54 +560,107 @@ class InformixConnector(SqlConnector):
         try:
             target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
 
-            logger.info(f"[IFX][IDX] get_table_indexes table_name={pure_table!r} schema={target_schema!r}")
+            logger.info(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix catalogs start=true"
+            )
 
             # 1) Get tabid once
-            sql_tabid = "SELECT FIRST 1 tabid FROM systables WHERE tabtype = 'T' AND tabname = ?"
+            sql_tabid = """
+                SELECT tabid
+                FROM informix.systables
+                WHERE tabtype = 'T'
+                  AND tabname = ?
+            """
             params: List[Any] = [pure_table]
             if target_schema:
                 sql_tabid += " AND owner = ?"
                 params.append(target_schema)
-            logger.info(f"[IFX][IDX] tabid_sql={sql_tabid}")
-            cursor.execute(sql_tabid, params)
+            try:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.systables parameter_binding=tuple"
+                )
+                cursor.execute(sql_tabid, tuple(params))
+            except Exception:
+                safe_table = pure_table.replace("'", "''")
+                fallback_query = sql_tabid.replace("?", f"'{safe_table}'", 1)
+                if target_schema:
+                    safe_owner = target_schema.replace("'", "''")
+                    fallback_query = fallback_query.replace("?", f"'{safe_owner}'", 1)
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.systables fallback=escaped_literal"
+                )
+                cursor.execute(fallback_query)
             row = cursor.fetchone()
             if not row:
                 logger.warning(f"Table not found in Informix catalogs: {table_name}")
                 return []
             tabid = int(row[0])
-            logger.info(f"[IFX][IDX] tabid={tabid} for table={table_name!r}")
+            logger.info(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} tabid={tabid}"
+            )
 
             sql_idx = """
                 SELECT
                     idxname, idxtype,
                     part1, part2, part3, part4, part5, part6, part7, part8,
                     part9, part10, part11, part12, part13, part14, part15, part16
-                FROM sysindexes
+                FROM informix.sysindexes
                 WHERE tabid = ?
             """
-            logger.info(f"[IFX][IDX] fetching sysindexes for tabid={tabid}")
-            cursor.execute(sql_idx, (tabid,))
+            try:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysindexes parameter_binding=tuple tabid={tabid}"
+                )
+                cursor.execute(sql_idx, (tabid,))
+            except Exception:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysindexes fallback=int_literal tabid={tabid}"
+                )
+                cursor.execute(sql_idx.replace("?", str(tabid), 1))
             index_rows = cursor.fetchall()
-            logger.info(f"[IFX][IDX] sysindexes rows={len(index_rows)} for tabid={tabid}")
+            logger.info(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysindexes rows={len(index_rows)} tabid={tabid}"
+            )
             if not index_rows:
                 return []
 
-            cursor.execute("SELECT colno, colname FROM syscolumns WHERE tabid = ?", (tabid,))
+            sql_columns = "SELECT colno, colname FROM informix.syscolumns WHERE tabid = ?"
+            try:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns parameter_binding=tuple tabid={tabid}"
+                )
+                cursor.execute(sql_columns, (tabid,))
+            except Exception:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns fallback=int_literal tabid={tabid}"
+                )
+                cursor.execute(sql_columns.replace("?", str(tabid), 1))
             col_map = {int(r[0]): r[1].strip() for r in cursor.fetchall()}
-            logger.info(f"[IFX][IDX] syscolumns mapped cols={len(col_map)}")
+            logger.info(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns mapped_cols={len(col_map)} tabid={tabid}"
+            )
 
-            cursor.execute(
-                """
+            sql_constraints = """
                 SELECT constrtype, idxname
-                FROM sysconstraints
+                FROM informix.sysconstraints
                 WHERE tabid = ?
                 AND constrtype IN ('P', 'U')
-                """,
-                (tabid,),
-            )
+                """
+            try:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysconstraints parameter_binding=tuple tabid={tabid}"
+                )
+                cursor.execute(sql_constraints, (tabid,))
+            except Exception:
+                logger.debug(
+                    f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysconstraints fallback=int_literal tabid={tabid}"
+                )
+                cursor.execute(sql_constraints.replace("?", str(tabid), 1))
             constraint_map: Dict[str, str] = {}
             rows = cursor.fetchall()
-            logger.info(f"[IFX][IDX] sysconstraints P/U rows={len(rows)}")
+            logger.info(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysconstraints rows={len(rows)} tabid={tabid}"
+            )
             for r in rows:
                 constrtype = r[0].strip() if r[0] else None
                 idxname = r[1].strip() if r[1] else None
@@ -622,14 +693,18 @@ class InformixConnector(SqlConnector):
                         "primary": bool(is_primary),
                         "columns": cols,
                         "source_idxtype": idxtype,
-                    }
+                        }
                 )
 
-            logger.info(f"[IFX][IDX] returning {len(results)} index defs")
+            logger.info(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} returning={len(results)}"
+            )
             return results
 
         except Exception as e:
-            logger.error(f"Error getting indexes for Informix table {table_name}: {e}")
+            logger.error(
+                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema if 'target_schema' in locals() else None} table={pure_table if 'pure_table' in locals() else table_name} failed: {e}"
+            )
             return []
         finally:
             cursor.close()
