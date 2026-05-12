@@ -82,6 +82,9 @@ class OracleConnector(SqlConnector):
         conn = self.get_connection()
         try:
             with conn.cursor() as cursor:
+                logger.info(
+                    f"[oracle][schema_discovery] database={self.database} query_path=all_tables.owner exclude_system=true"
+                )
                 cursor.execute(
                     """
                     SELECT DISTINCT owner
@@ -106,7 +109,9 @@ class OracleConnector(SqlConnector):
                 )
                 return [row[0] for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Error getting schemas: {e}")
+            logger.error(
+                f"[oracle][schema_discovery] database={self.database} query_path=all_tables.owner failed: {e}"
+            )
             return []
         finally:
             conn.close()
@@ -261,6 +266,9 @@ class OracleConnector(SqlConnector):
         target_schema = (self._normalize_identifier(schema) or self.schema).upper()
         try:
             with conn.cursor() as cur:
+                logger.info(
+                    f"[oracle][table_discovery] database={self.database} selected_schema={target_schema} query_path=all_tables.owner"
+                )
                 cur.execute(
                     """
                     SELECT table_name
@@ -274,7 +282,9 @@ class OracleConnector(SqlConnector):
                 logger.info(f"Tables: {tables}")
                 return tables
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(
+                f"[oracle][table_discovery] database={self.database} selected_schema={target_schema} query_path=all_tables.owner failed: {e}"
+            )
             return []
         finally:
             conn.close()

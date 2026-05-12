@@ -49,6 +49,9 @@ class PostgresConnector(SqlConnector):
         conn = self.get_connection()
         cur = conn.cursor()
         try:
+            logger.info(
+                f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace exclude_system=true"
+            )
             cur.execute(
                 """
                 SELECT nspname
@@ -60,7 +63,9 @@ class PostgresConnector(SqlConnector):
             )
             return [row[0] for row in cur.fetchall()]
         except Exception as e:
-            logger.error(f"Error getting schemas: {e}")
+            logger.error(
+                f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace failed: {e}"
+            )
             return []
         finally:
             cur.close()
@@ -296,6 +301,9 @@ class PostgresConnector(SqlConnector):
         cur = conn.cursor()
         target_schema = self._normalize_identifier(schema) or self.schema
         try:
+            logger.info(
+                f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables"
+            )
             cur.execute(
                 """
                 SELECT table_name
@@ -307,7 +315,9 @@ class PostgresConnector(SqlConnector):
             )
             return [row[0] for row in cur.fetchall()]
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(
+                f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables failed: {e}"
+            )
             return []
         finally:
             cur.close()

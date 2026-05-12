@@ -53,20 +53,22 @@ class InformixConnector(SqlConnector):
         connection = self.get_connection()
         cursor = connection.cursor()
         try:
+            logger.info(
+                f"[informix][schema_discovery] database={self.database} schema_equivalent=owner query_path=systables"
+            )
             cursor.execute(
                 """
                 SELECT DISTINCT owner
                 FROM systables
                 WHERE tabtype = 'T'
-                  AND tabid >= 100
-                  AND owner IS NOT NULL
-                  AND owner <> 'informix'
                 ORDER BY owner
                 """
             )
             return [row[0].strip() for row in cursor.fetchall() if row[0]]
         except Exception as e:
-            logger.error(f"Error getting schemas: {e}")
+            logger.error(
+                f"[informix][schema_discovery] database={self.database} schema_equivalent=owner query_path=systables failed: {e}"
+            )
             return []
         finally:
             cursor.close()
@@ -138,22 +140,42 @@ class InformixConnector(SqlConnector):
         target_schema = self._normalize_identifier(schema) or self.schema
         try:
             if target_schema:
-                cursor.execute(
-                    """
+                sql = """
                     SELECT tabname
-                    FROM systables
+                    FROM informix.systables
                     WHERE tabtype = 'T'
                       AND tabid >= 100
                       AND owner = ?
                     ORDER BY tabname
-                    """,
-                    (target_schema,),
-                )
+                    """
+                try:
+                    logger.info(
+                        f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables parameter_binding=tuple"
+                    )
+                    cursor.execute(sql, (target_schema,))
+                except Exception:
+                    safe_schema = target_schema.replace("'", "''")
+                    logger.info(
+                        f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables fallback=escaped_literal"
+                    )
+                    cursor.execute(
+                        f"""
+                        SELECT tabname
+                        FROM informix.systables
+                        WHERE tabtype = 'T'
+                          AND tabid >= 100
+                          AND owner = '{safe_schema}'
+                        ORDER BY tabname
+                        """
+                    )
             else:
+                logger.info(
+                    f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables unfiltered=true"
+                )
                 cursor.execute(
                     """
                     SELECT tabname
-                    FROM systables
+                    FROM informix.systables
                     WHERE tabtype = 'T'
                       AND tabid >= 100
                     ORDER BY tabname
@@ -162,7 +184,9 @@ class InformixConnector(SqlConnector):
             tables = [row[0] for row in cursor.fetchall()]
             return tables
         except Exception as e:
-            logger.error(f"Error getting tables for schema '{target_schema}': {e}")
+            logger.error(
+                f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables failed: {e}"
+            )
             return []
         finally:
             cursor.close()

@@ -49,6 +49,9 @@ class MySQLConnector(SqlConnector):
         return self._quote_identifier(resolved_table)
 
     def get_connection_schemas(self) -> List[str]:
+        logger.info(
+            f"[mysql][schema_discovery] database={self.database} query_path=current_database_singleton schema_model=database"
+        )
         return [self.database]
 
     def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
@@ -238,6 +241,9 @@ class MySQLConnector(SqlConnector):
         cursor = conn.cursor()
         target_schema = self._normalize_identifier(schema) or self.database
         try:
+            logger.info(
+                f"[mysql][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables schema_model=database"
+            )
             cursor.execute(
                 """
                 SELECT table_name
@@ -249,7 +255,9 @@ class MySQLConnector(SqlConnector):
             )
             return [row[0] for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(
+                f"[mysql][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables schema_model=database failed: {e}"
+            )
             return []
         finally:
             cursor.close()

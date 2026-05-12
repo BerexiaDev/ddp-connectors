@@ -58,6 +58,9 @@ class SqlServerConnector(SqlConnector):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
+            logger.info(
+                f"[sqlserver][schema_discovery] database={self.database} query_path=sys.schemas exclude_system=true"
+            )
             cursor.execute(
                 """
                 SELECT name
@@ -81,7 +84,9 @@ class SqlServerConnector(SqlConnector):
             )
             return [row[0] for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Error getting schemas: {e}")
+            logger.error(
+                f"[sqlserver][schema_discovery] database={self.database} query_path=sys.schemas failed: {e}"
+            )
             return []
         finally:
             cursor.close()
@@ -161,11 +166,16 @@ class SqlServerConnector(SqlConnector):
                   AND s.name = ?
             """
         try:
+            logger.info(
+                f"[sqlserver][table_discovery] database={self.database} selected_schema={target_schema} query_path=sys.tables+sys.schemas"
+            )
             cursor.execute(sql, target_schema)
             tables = [row.name for row in cursor.fetchall()]
             return tables
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(
+                f"[sqlserver][table_discovery] database={self.database} selected_schema={target_schema} query_path=sys.tables+sys.schemas failed: {e}"
+            )
             return []
         finally:
             cursor.close()
