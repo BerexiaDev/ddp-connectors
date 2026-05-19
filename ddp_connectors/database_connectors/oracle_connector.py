@@ -2,11 +2,9 @@ import oracledb
 from datetime import datetime
 
 from loguru import logger
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from .sql_connector import SqlConnector
-from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
-
-from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, safe_convert_to_string
+from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, normalize_ui_column_type, safe_convert_to_string
 from ddp_lib.utils import serialize_if_needed
 
 
@@ -23,6 +21,7 @@ class OracleConnector(SqlConnector):
         Tests the database connection and verifies the target schema exists.
         Returns True if successful, raises an Exception or returns False if not.
         """
+        conn = None
         try:
             # 1. This tests if the Host, Port, Database, User, and Password are correct.
             # If get_connection() fails, it throws an exception immediately.
@@ -51,7 +50,8 @@ class OracleConnector(SqlConnector):
             return False
             
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def get_connection(self):
         # automatically fetch CLOBs/BLOBs as strings/bytes
@@ -67,6 +67,75 @@ class OracleConnector(SqlConnector):
         conn.outputtypehandler = self._oracle_type_handler
         
         return conn
+
+    def _quote_identifier(self, identifier: str) -> str:
+        normalized = (self._normalize_identifier(identifier) or "").upper()
+        return f'"{normalized.replace(chr(34), chr(34) * 2)}"'
+
+    def _qualify_table_sql(self, table_name: str, schema: Optional[str] = None) -> str:
+        resolved_schema, resolved_table = self.resolve_schema_and_table(table_name, schema)
+        if resolved_schema:
+            return f"{self._quote_identifier(resolved_schema)}.{self._quote_identifier(resolved_table)}"
+        return self._quote_identifier(resolved_table)
+
+    def get_connection_schemas(self) -> List[str]:
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                logger.info(
+                    f"[oracle][schema_discovery] database={self.database} query_path=all_tables.owner exclude_system=true"
+                )
+                cursor.execute(
+                    """
+                    SELECT DISTINCT owner
+                    FROM all_tables
+                    WHERE owner NOT IN (
+                        'SYS',
+                        'SYSTEM',
+                        'XDB',
+                        'CTXSYS',
+                        'MDSYS',
+                        'ORDSYS',
+                        'OUTLN',
+                        'DBSNMP',
+                        'WMSYS',
+                        'APPQOSSYS',
+                        'AUDSYS',
+                        'GSMADMIN_INTERNAL',
+                        'ANONYMOUS'
+                    )
+                    ORDER BY owner
+                    """
+                )
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(
+                f"[oracle][schema_discovery] database={self.database} query_path=all_tables.owner failed: {e}"
+            )
+            return []
+        finally:
+            conn.close()
+
+    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None, schema: Optional[str] = None) -> List[Dict[str, Any]]:
+        qualified_table = self._qualify_table_sql(table_name, schema)
+        query = (
+            f"SELECT * FROM {qualified_table} "
+            f"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
+        )
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                cols = [c[0] for c in cursor.description]
+                return [
+                    {col: safe_convert_to_string(row[idx]) for idx, col in enumerate(cols)}
+                    for row in cursor.fetchall()
+                ]
+        except Exception as exc:
+            logger.error(f"Error extracting batch from {qualified_table}: {exc}")
+            return []
+        finally:
+            conn.close()
 
     
     def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
@@ -121,10 +190,12 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def fetch_batch(self, cursor, table_name, offset: int, limit: int = 100):
+    def fetch_batch(self, cursor, table_name, offset: int, batch_size: int = 100, schema: Optional[str] = None, **kwargs):
         try:
             oracledb.defaults.fetch_lobs = False
-            query = f'SELECT * FROM {self.schema}.\"{table_name}\" OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY'
+            limit = kwargs.get("limit", batch_size)
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            query = f"SELECT * FROM {qualified_table} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
             cursor.execute(query)
             return cursor.fetchall()
         except Exception as e:
@@ -153,49 +224,75 @@ class OracleConnector(SqlConnector):
                 outconverter=bfile_out_converter
             )
 
-    def stream_batch(self, table_name: str, batch_size: int = 10_000):
+    def stream_batch(self, cursor=None, table_name: Optional[str] = None, batch_size: int = 10_000, schema: Optional[str] = None):
         """Streaming for Oracle using fetchmany. Oracle driver handles arraysize natively."""
-        conn = self.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.arraysize = batch_size
-                logger.info(f"Start streaming Oracle table {table_name} with batch_size={batch_size}")
-                cursor.execute(f"SELECT * FROM {self.schema}.{table_name}")
+        conn = None
+        managed_cursor = None
+        if table_name is None and isinstance(cursor, str):
+            table_name = cursor
+            cursor = None
 
-                while True:
-                    rows = cursor.fetchmany(batch_size)
-                    if not rows:
-                        break
-                    yield rows
-                logger.info(f"Finished streaming Oracle table {table_name}")
+        if not table_name:
+            raise ValueError("table_name is required")
+
+        qualified_table = self._qualify_table_sql(table_name, schema)
+        try:
+            if cursor is None:
+                conn = self.get_connection()
+                managed_cursor = conn.cursor()
+            else:
+                managed_cursor = cursor
+
+            managed_cursor.arraysize = batch_size
+            logger.info(f"Start streaming Oracle table {qualified_table} with batch_size={batch_size}")
+            managed_cursor.execute(f"SELECT * FROM {qualified_table}")
+
+            while True:
+                rows = managed_cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield rows
+            logger.info(f"Finished streaming Oracle table {qualified_table}")
         except Exception as exc:
             logger.error(f"Error streaming batch from Oracle table {table_name}: {exc}")
         finally:
-            conn.close()
+            if managed_cursor and conn:
+                managed_cursor.close()
+            if conn:
+                conn.close()
 
-    def get_connection_tables(self):
+    def get_connection_tables(self, schema: Optional[str] = None):
         conn = self.get_connection()
+        target_schema = (self._normalize_identifier(schema) or self.schema).upper()
         try:
             with conn.cursor() as cur:
+                logger.info(
+                    f"[oracle][table_discovery] database={self.database} selected_schema={target_schema} query_path=all_tables.owner"
+                )
                 cur.execute(
                     """
                     SELECT table_name
                     FROM all_tables
                     WHERE owner = :1
+                    ORDER BY table_name
                     """,
-                    [self.schema]
+                    [target_schema]
                 )
                 tables =  [row[0] for row in cur.fetchall()]
                 logger.info(f"Tables: {tables}")
                 return tables
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(
+                f"[oracle][table_discovery] database={self.database} selected_schema={target_schema} query_path=all_tables.owner failed: {e}"
+            )
             return []
         finally:
             conn.close()
 
-    def get_connection_columns(self, table_name: str):
+    def get_connection_columns(self, table_name: str, schema: Optional[str] = None):
         conn = self.get_connection()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        schema_name = (target_schema or self.schema).upper()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -205,14 +302,19 @@ class OracleConnector(SqlConnector):
                     WHERE owner = :1 AND table_name = :2
                     ORDER BY column_id
                     """,
-                    [self.schema, table_name.upper()]
+                    [schema_name, pure_table.upper()]
                 )
                 rows = cur.fetchall()
 
-                columns: list[dict[str, str]] = []
+                columns: List[Dict[str, str]] = []
                 for column_name, data_type in rows:
-                    ts_type = cast_oracle_to_typescript(data_type)
-                    columns.append({"name": column_name, "type": ts_type, "alias": column_name})
+                    ts_type = normalize_ui_column_type(cast_oracle_to_typescript(data_type))
+                    columns.append({
+                        "name": column_name,
+                        "type": ts_type,
+                        "alias": column_name,
+                        "classification": "",
+                    })
                 return columns
         except Exception as e:
             logger.error(f"Error getting columns: {e}")
@@ -220,12 +322,13 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def count_table_rows(self, table_name: str) -> int:
+    def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
+        schema, _ = self.coerce_schema_and_filters(schema, filters)
+        qualified_table = self._qualify_table_sql(table_name, schema)
         conn = self.get_connection()
         try:
             with conn.cursor() as cursor:
-                # Add .upper() to the table name
-                sql = f"SELECT COUNT(*) FROM {self.schema}.\"{table_name.upper()}\""
+                sql = f"SELECT COUNT(*) FROM {qualified_table}"
                 cursor.execute(sql)
                 count_result = cursor.fetchone()
                 return int(count_result[0]) if count_result else 0
@@ -235,14 +338,15 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def get_min_max_date(self, table_name: str, column_name: str):
+    def get_min_max_date(self, table_name: str, column_name: str, schema: Optional[str] = None):
         conn = self.get_connection()
+        qualified_table = self._qualify_table_sql(table_name, schema)
         try:
             with conn.cursor() as cur:
                 sql = (
-                    f'SELECT MIN("{column_name}"), MAX("{column_name}") '
-                    f'FROM {self.schema}."{table_name}" '
-                    f'WHERE "{column_name}" IS NOT NULL'
+                    f"SELECT MIN({self._quote_identifier(column_name)}), MAX({self._quote_identifier(column_name)}) "
+                    f"FROM {qualified_table} "
+                    f"WHERE {self._quote_identifier(column_name)} IS NOT NULL"
                 )
                 cur.execute(sql)
                 row = cur.fetchone()
@@ -250,8 +354,10 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def extract_table_schema(self, table_name):
+    def extract_table_schema(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        schema_name = (target_schema or self.schema).upper()
         try:
             with conn.cursor() as cursor:
                 schema_sql = """
@@ -286,8 +392,8 @@ class OracleConnector(SqlConnector):
                 
                 # Pass a dictionary instead of a list for named binds
                 bind_params = {
-                    "schema_name": self.schema,
-                    "table_name": table_name.upper()
+                    "schema_name": schema_name,
+                    "table_name": pure_table.upper()
                 }
                 
                 cursor.execute(schema_sql, bind_params)
@@ -341,17 +447,23 @@ class OracleConnector(SqlConnector):
         finally:
             conn.close()
 
-    def fetch_deltas(self, cursor, primary_key: str, log_table: str, since_ts: datetime, batch_size: int = 10_000):
-        # Replaced Postgres DISTINCT ON with ROW_NUMBER window function
+    def fetch_deltas(self, cursor, primary_keys, log_table: str, since_ts: datetime, batch_size: int = 10_000, schema: Optional[str] = None):
+        primary_keys = self.normalize_primary_keys(primary_keys)
+        qualified_log_table = self._qualify_table_sql(log_table, schema)
+        if not primary_keys:
+            logger.error("fetch_deltas requires at least one primary key column.")
+            return
+
+        partition_cols = ", ".join(self._quote_identifier(pk) for pk in primary_keys)
         sql = f"""
             SELECT * FROM (
                 SELECT t.*, 
-                       ROW_NUMBER() OVER(PARTITION BY "{primary_key}" ORDER BY "Date_operation" DESC) as rn
-                FROM {self.schema}."{log_table}" t
+                       ROW_NUMBER() OVER(PARTITION BY {partition_cols} ORDER BY "Date_operation" DESC) as rn
+                FROM {qualified_log_table} t
                 WHERE "Date_operation" > :1
             )
             WHERE rn = 1
-            ORDER BY "{primary_key}", "Date_operation" DESC
+            ORDER BY {partition_cols}, "Date_operation" DESC
             OFFSET :2 ROWS FETCH NEXT :3 ROWS ONLY
         """
         offset = 0
@@ -370,30 +482,57 @@ class OracleConnector(SqlConnector):
             offset += batch_size
             
 
-    def get_table_indexes(self, table_name: str) -> list:
+    def get_table_indexes(self, table_name: str, schema: Optional[str] = None) -> list:
         """Returns a list of indexes for the given table."""
         conn = self.get_connection()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        schema_name = (target_schema or self.schema).upper()
         try:
             with conn.cursor() as cursor:
                 sql = """
-                    SELECT index_name, column_name 
-                    FROM all_ind_columns 
-                    WHERE table_name = :table_name AND index_owner = :schema_name
-                    ORDER BY index_name, column_position
+                    SELECT
+                        c.index_name,
+                        c.column_name,
+                        i.uniqueness
+                    FROM all_ind_columns c
+                    JOIN all_indexes i
+                      ON i.owner = c.index_owner
+                     AND i.index_name = c.index_name
+                    WHERE c.table_name = :table_name
+                      AND c.index_owner = :schema_name
+                    ORDER BY c.index_name, c.column_position
                 """
-                cursor.execute(sql, {"table_name": table_name.upper(), "schema_name": self.schema})
+                cursor.execute(sql, {"table_name": pure_table.upper(), "schema_name": schema_name})
                 rows = cursor.fetchall()
                 
                 # Group columns by index name
                 indexes = {}
-                for idx_name, col_name in rows:
+                for idx_name, col_name, uniqueness in rows:
                     if idx_name not in indexes:
-                        indexes[idx_name] = []
-                    indexes[idx_name].append(col_name)
+                        indexes[idx_name] = {"columns": [], "unique": uniqueness == "UNIQUE"}
+                    indexes[idx_name]["columns"].append(col_name)
                     
-                return [{"name": name, "columns": cols} for name, cols in indexes.items()]
+                return [
+                    {"name": name, "columns": details["columns"], "unique": details["unique"]}
+                    for name, details in indexes.items()
+                ]
         except Exception as e:
             logger.error(f"Error getting table indexes for {table_name}: {e}")
             return []
+        finally:
+            conn.close()
+
+    def truncate_table(self, table_name: str, schema: Optional[str] = None) -> bool:
+        conn = self.get_connection()
+        qualified_table = self._qualify_table_sql(table_name, schema)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"TRUNCATE TABLE {qualified_table}")
+                conn.commit()
+                return True
+        except Exception as exc:
+            conn.rollback()
+            logger.error(f"Failed to truncate table {qualified_table}: {exc}")
+            return False
         finally:
             conn.close()
