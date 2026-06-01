@@ -214,8 +214,9 @@ class PostgresConnector(SqlConnector):
     def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         where_clause, params = self._build_filters_clause(filters)
         qualified_table = self._qualify_table_sql(table_name, schema)
+        select_clause = self._build_display_select_clause(table_name, schema)
         query = (
-            f"SELECT * FROM {qualified_table}"
+            f"SELECT {select_clause} FROM {qualified_table}"
             f"{where_clause} "
             f"OFFSET {offset} LIMIT {limit};"
         )
@@ -1200,6 +1201,53 @@ class PostgresConnector(SqlConnector):
         except Exception as e:
             logger.error(f"Error getting indexes for Postgres table {self.qualify_table_name(table_name, schema)}: {e}")
             return []
+        finally:
+            cur.close()
+            conn.close()
+
+
+    def _build_display_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
+        """
+        Build a SELECT clause suitable for UI display.
+
+        Spatial/PostGIS columns are rendered as readable text instead of EWKB hex.
+        Example:
+            geometry(Point,4326) -> POINT(-7.5898 33.5731)
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+
+        try:
+            cur.execute(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                AND table_name = %s
+                ORDER BY ordinal_position;
+                """,
+                (target_schema, pure_table),
+            )
+
+            select_parts = []
+
+            for column_name, data_type, udt_name in cur.fetchall():
+                quoted_col = self._quote_identifier(column_name)
+
+                # PostGIS geometry/geography columns
+                if data_type == "USER-DEFINED" and udt_name in ("geometry", "geography"):
+                    select_parts.append(
+                        f"ST_AsText({quoted_col}) AS {quoted_col}"
+                    )
+                else:
+                    select_parts.append(quoted_col)
+
+            return ", ".join(select_parts) if select_parts else "*"
+
         finally:
             cur.close()
             conn.close()
