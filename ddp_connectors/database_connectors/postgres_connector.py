@@ -265,6 +265,7 @@ class PostgresConnector(SqlConnector):
 
         cursor_name = f"stream_{table_name.replace('.', '_')}"
         qualified_table = self._qualify_table_sql(table_name, schema)
+        select_clause = self._build_stream_select_clause(table_name, schema)
 
         try:
             if cursor is None:
@@ -277,7 +278,7 @@ class PostgresConnector(SqlConnector):
             managed_cursor.itersize = batch_size
 
             logger.info(f"Start streaming Postgres table {qualified_table} with batch_size={batch_size}")
-            managed_cursor.execute(f"SELECT * FROM {qualified_table}")
+            managed_cursor.execute(f"SELECT {select_clause} FROM {qualified_table}")
 
             while True:
                 rows = managed_cursor.fetchmany(batch_size)
@@ -289,7 +290,7 @@ class PostgresConnector(SqlConnector):
 
         except Exception as exc:
             logger.error(f"Error streaming batch from Postgres table {table_name}: {exc}")
-            return
+            raise
 
         finally:
             if managed_cursor and conn:
@@ -1205,6 +1206,54 @@ class PostgresConnector(SqlConnector):
             cur.close()
             conn.close()
 
+
+    def _build_stream_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
+        """
+        Build a SELECT clause for full-sync streaming.
+
+        Risky Postgres date/time values are cast to text so psycopg2 does not
+        attempt to coerce out-of-range values into Python datetime objects.
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        risky_types = {
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "time with time zone",
+        }
+
+        try:
+            cur.execute(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                ORDER BY ordinal_position;
+                """,
+                (target_schema, pure_table),
+            )
+
+            select_parts = []
+
+            for column_name, data_type, _udt_name in cur.fetchall():
+                quoted_col = self._quote_identifier(column_name)
+                if data_type in risky_types:
+                    select_parts.append(f"{quoted_col}::text AS {quoted_col}")
+                else:
+                    select_parts.append(quoted_col)
+
+            return ", ".join(select_parts) if select_parts else "*"
+
+        finally:
+            cur.close()
+            conn.close()
 
     def _build_display_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
         """
