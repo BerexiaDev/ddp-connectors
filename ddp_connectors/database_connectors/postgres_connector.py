@@ -1266,6 +1266,13 @@ class PostgresConnector(SqlConnector):
         conn = self.get_connection()
         cur = conn.cursor()
         target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        DATE_TIME_TYPES = {
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "time with time zone",
+        }
 
         try:
             cur.execute(
@@ -1286,12 +1293,12 @@ class PostgresConnector(SqlConnector):
 
             for column_name, data_type, udt_name in cur.fetchall():
                 quoted_col = self._quote_identifier(column_name)
-
-                # PostGIS geometry/geography columns
                 if data_type == "USER-DEFINED" and udt_name in ("geometry", "geography"):
                     select_parts.append(
                         f"ST_AsText({quoted_col}) AS {quoted_col}"
                     )
+                elif data_type in DATE_TIME_TYPES:
+                    select_parts.append(f"{quoted_col}::text AS {quoted_col}")
                 else:
                     select_parts.append(quoted_col)
 
