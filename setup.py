@@ -10,6 +10,7 @@ setup(
         "psycopg2",
         "sqlalchemy",
         "cx_oracle",
+        "mysql-connector-python",
         "loguru",
         "jaydebeapi",  # Db2 for IBM i (JDBC via JTOpen jt400.jar)
         "JPype1",      # JVM bridge used by jaydebeapi

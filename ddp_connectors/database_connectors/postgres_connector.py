@@ -5,13 +5,13 @@ import re, psycopg2
 from datetime import datetime
 
 from loguru import logger
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from pyodbc import Cursor
 
 from .sql_connector import SqlConnector
 from ddp_connectors.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
     _build_having_clause
-from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript
+from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript, normalize_ui_column_type
 from .sql_connector_utils import safe_convert_to_string
 
 
@@ -34,6 +34,42 @@ class PostgresConnector(SqlConnector):
         }
 
         return psycopg2.connect(**conn_params)
+
+    def _quote_identifier(self, identifier: str) -> str:
+        normalized = self._normalize_identifier(identifier) or ""
+        return f'"{normalized.replace(chr(34), chr(34) * 2)}"'
+
+    def _qualify_table_sql(self, table_name: str, schema: Optional[str] = None) -> str:
+        resolved_schema, resolved_table = self.resolve_schema_and_table(table_name, schema)
+        if resolved_schema:
+            return f"{self._quote_identifier(resolved_schema)}.{self._quote_identifier(resolved_table)}"
+        return self._quote_identifier(resolved_table)
+
+    def get_connection_schemas(self) -> List[str]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        try:
+            logger.info(
+                f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace exclude_system=true"
+            )
+            cur.execute(
+                """
+                SELECT nspname
+                FROM pg_namespace
+                WHERE nspname NOT LIKE 'pg_%'
+                  AND nspname <> 'information_schema'
+                ORDER BY nspname;
+                """
+            )
+            return [row[0] for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(
+                f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace failed: {e}"
+            )
+            return []
+        finally:
+            cur.close()
+            conn.close()
 
     def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
         """Parse filters payload into a safe WHERE clause and parameters."""
@@ -86,12 +122,44 @@ class PostgresConnector(SqlConnector):
                 "IS_NOT_NULL": "IS NOT NULL",
             }
 
+            # Operators that benefit from a numeric cast when applied to JSONB text output
+            numeric_ops = {"GREATER_THAN", "LESS_THAN", "GREATER_THAN_OR_EQUAL", "LESS_THAN_OR_EQUAL", "BETWEEN", "NOT_BETWEEN", ">", "<", ">=", "<="}
+
             for condition in parsed_filters:
                 col_info = condition.get("column") or {}
                 col_name = col_info.get("name")
-                if not col_name or not isinstance(col_name, str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name):
+                
+                if not col_name or not isinstance(col_name, str):
                     logger.warning(f"Skipping filter with invalid column name: {col_name}")
                     continue
+
+                # JSONB path filter: dynamically check if the column name contains a dot separator
+                is_jsonb_path = "." in col_name
+
+                if is_jsonb_path:
+                    parts = col_name.split(".")
+                    root_col = parts[0]
+                    json_parts = parts[1:]
+                    
+                    # Validate root column
+                    if not root_col or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", root_col):
+                        logger.warning(f"Skipping filter with invalid root JSONB column: {root_col}")
+                        continue
+
+                    # Validate nested path parts
+                    if not json_parts or not all(re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", p) for p in json_parts if p):
+                        logger.warning(f"Skipping filter with invalid JSONB path: {col_name}")
+                        continue
+                        
+                    # Build PostgreSQL JSONB path expression: "root_col"->'p1'->>'lastPart'
+                    col_expr = f'"{root_col}"'
+                    for i, part in enumerate(json_parts):
+                        col_expr += f"->>'{part}'" if i == len(json_parts) - 1 else f"->'{part}'"
+                else:
+                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name):
+                        logger.warning(f"Skipping filter with invalid column name: {col_name}")
+                        continue
+                    col_expr = f'"{col_name}"'
 
                 raw_operator = condition.get("operator")
                 op_key = str(raw_operator).strip().upper().replace(" ", "_") if raw_operator else None
@@ -100,6 +168,10 @@ class PostgresConnector(SqlConnector):
                     logger.warning(f"Skipping unsupported operator '{raw_operator}' for column '{col_name}'")
                     continue
 
+                # For JSONB paths with numeric comparison operators, cast the text output to numeric
+                if is_jsonb_path and op_key in numeric_ops:
+                    col_expr = f"({col_expr})::numeric"
+
                 value = condition.get("value")
                 value_to = condition.get("valueTo")
 
@@ -107,7 +179,7 @@ class PostgresConnector(SqlConnector):
                     if value is None or value_to is None:
                         logger.warning(f"Skipping BETWEEN filter for '{col_name}' because bounds are missing.")
                         continue
-                    clauses.append(f"\"{col_name}\" {sql_op} %s AND %s")
+                    clauses.append(f"{col_expr} {sql_op} %s AND %s")
                     params.extend([value, value_to])
                 elif op_key in ("IN", "NOT_IN"):
                     values = value
@@ -117,36 +189,38 @@ class PostgresConnector(SqlConnector):
                         logger.warning(f"Skipping IN filter for '{col_name}' due to empty values.")
                         continue
                     placeholders = ", ".join(["%s"] * len(values))
-                    clauses.append(f"\"{col_name}\" {sql_op} ({placeholders})")
+                    clauses.append(f"{col_expr} {sql_op} ({placeholders})")
                     params.extend(values)
                 elif op_key in ("IS_NULL", "IS_NOT_NULL"):
-                    clauses.append(f"\"{col_name}\" {sql_op}")
+                    clauses.append(f"{col_expr} {sql_op}")
                 elif isinstance(sql_op, tuple):
                     sql_operator, pattern_builder = sql_op
                     if value is None:
                         logger.warning(f"Skipping filter for '{col_name}' because value is missing.")
                         continue
-                    clauses.append(f"\"{col_name}\" {sql_operator} %s")
+                    clauses.append(f"{col_expr} {sql_operator} %s")
                     params.append(pattern_builder(value))
                 else:
                     if value is None:
                         logger.warning(f"Skipping filter for '{col_name}' because value is missing.")
                         continue
-                    clauses.append(f"\"{col_name}\" {sql_op} %s")
+                    clauses.append(f"{col_expr} {sql_op} %s")
                     params.append(value)
 
         where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where_clause, params
 
 
-    def extract_data_batch( self, table_name: str, offset: int = 0, limit: int = 100, filters=None) -> List[Dict[str, Any]]:
+    def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         where_clause, params = self._build_filters_clause(filters)
+        qualified_table = self._qualify_table_sql(table_name, schema)
+        select_clause = self._build_display_select_clause(table_name, schema)
         query = (
-            f"SELECT * FROM {table_name}"
+            f"SELECT {select_clause} FROM {qualified_table}"
             f"{where_clause} "
             f"OFFSET {offset} LIMIT {limit};"
         )
-        logger.info(f"Fetching batch: table={table_name}, offset={offset}, limit={limit}, filters_applied={bool(where_clause.strip())}")
+        logger.info(f"Fetching batch: table={qualified_table}, offset={offset}, limit={limit}, filters_applied={bool(where_clause.strip())}")
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -163,9 +237,11 @@ class PostgresConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def fetch_batch(self, cursor: Cursor, table_name, offset: int, limit: int = 100):
+    def fetch_batch(self, cursor: Cursor, table_name, offset: int, batch_size: int = 100, schema: Optional[str] = None, **kwargs):
         try:
-            query = f'SELECT * FROM {table_name} OFFSET {offset} LIMIT {limit}'
+            limit = kwargs.get("limit", batch_size)
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            query = f"SELECT * FROM {qualified_table} OFFSET {offset} LIMIT {limit}"
             cursor.execute(query)
             results = cursor.fetchall()
             return results
@@ -173,46 +249,63 @@ class PostgresConnector(SqlConnector):
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
             return []
 
-    def stream_batch(self, table_name: str, batch_size: int = 10_000,):
+    def stream_batch(self, cursor=None, table_name: Optional[str] = None, batch_size: int = 10_000, schema: Optional[str] = None):
         """
         Full-sync streaming for Postgres using a server-side cursor.
         Avoids OFFSET and prevents loading the full result set into memory.
         """
         conn = None
-        cursor = None
+        managed_cursor = None
+        if table_name is None and isinstance(cursor, str):
+            table_name = cursor
+            cursor = None
+
+        if not table_name:
+            raise ValueError("table_name is required")
+
         cursor_name = f"stream_{table_name.replace('.', '_')}"
+        qualified_table = self._qualify_table_sql(table_name, schema)
+        select_clause = self._build_stream_select_clause(table_name, schema)
 
         try:
-            conn = self.get_connection()
-            # IMPORTANT: server-side cursors require an open transaction
-            cursor = conn.cursor(name=cursor_name)
-            cursor.itersize = batch_size
+            if cursor is None:
+                conn = self.get_connection()
+                # IMPORTANT: server-side cursors require an open transaction
+                managed_cursor = conn.cursor(name=cursor_name)
+            else:
+                managed_cursor = cursor
 
-            logger.info(f"Start streaming Postgres table {table_name} with batch_size={batch_size}")
-            cursor.execute(f"SELECT * FROM {table_name}")
+            managed_cursor.itersize = batch_size
+
+            logger.info(f"Start streaming Postgres table {qualified_table} with batch_size={batch_size}")
+            managed_cursor.execute(f"SELECT {select_clause} FROM {qualified_table}")
 
             while True:
-                rows = cursor.fetchmany(batch_size)
+                rows = managed_cursor.fetchmany(batch_size)
                 if not rows:
                     break
                 yield rows
 
-            logger.info(f"Finished streaming Postgres table {table_name}")
+            logger.info(f"Finished streaming Postgres table {qualified_table}")
 
         except Exception as exc:
             logger.error(f"Error streaming batch from Postgres table {table_name}: {exc}")
-            return
+            raise
 
         finally:
-            if cursor:
-                cursor.close()
+            if managed_cursor and conn:
+                managed_cursor.close()
             if conn:
                 conn.close()
 
-    def get_connection_tables(self):
+    def get_connection_tables(self, schema: Optional[str] = None):
         conn = self.get_connection()
         cur = conn.cursor()
+        target_schema = self._normalize_identifier(schema) or self.schema
         try:
+            logger.info(
+                f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables"
+            )
             cur.execute(
                 """
                 SELECT table_name
@@ -220,19 +313,22 @@ class PostgresConnector(SqlConnector):
                 WHERE table_schema = %s
                   AND table_type   = 'BASE TABLE';
                 """,
-                (self.schema,),
+                (target_schema,),
             )
             return [row[0] for row in cur.fetchall()]
         except Exception as e:
-            logger.error(f"Error getting tables: {e}")
+            logger.error(
+                f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables failed: {e}"
+            )
             return []
         finally:
             cur.close()
             conn.close()
 
-    def get_connection_columns(self, table_name: str):
+    def get_connection_columns(self, table_name: str, schema: Optional[str] = None):
         conn = self.get_connection()
         cur = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             cur.execute(
                 """
@@ -245,14 +341,20 @@ class PostgresConnector(SqlConnector):
                   AND table_name   = %s
                 ORDER BY ordinal_position;
                 """,
-                (self.schema, table_name),
+                (target_schema, pure_table),
             )
             rows = cur.fetchall()
 
-            columns: list[dict[str, str]] = []
+            columns: List[Dict[str, str]] = []
             for column_name, data_type, udt_name in rows:
-                ts_type = cast_postgres_to_typescript(data_type)
-                columns.append({"name": column_name, "type": ts_type, "alias": column_name})
+                type_source = udt_name if data_type == "USER-DEFINED" else data_type
+                ts_type = normalize_ui_column_type(cast_postgres_to_typescript(type_source))
+                columns.append({
+                    "name": column_name,
+                    "type": ts_type,
+                    "alias": column_name,
+                    "classification": "",
+                })
             return columns
         except Exception as e:
             logger.error(f"Error getting columns: {e}")
@@ -262,12 +364,14 @@ class PostgresConnector(SqlConnector):
             conn.close()
 
 
-    def count_table_rows(self, table_name: str, filters=None) -> int:
+    def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
+        schema, filters = self.coerce_schema_and_filters(schema, filters)
         where_clause, params = self._build_filters_clause(filters)
+        qualified_table = self._qualify_table_sql(table_name, schema)
         connection = self.get_connection()
         cursor = connection.cursor()
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}{where_clause}", params)
+            cursor.execute(f"SELECT COUNT(*) FROM {qualified_table}{where_clause}", params)
             count_result = cursor.fetchone()
             total_count = int(count_result[0]) if count_result else 0
             return total_count
@@ -278,7 +382,7 @@ class PostgresConnector(SqlConnector):
             cursor.close()
             connection.close()
 
-    def get_min_max_date(self, table_name: str, column_name: str):
+    def get_min_max_date(self, table_name: str, column_name: str, schema: Optional[str] = None):
         """
         Returns (min_value, max_value) for a DATE/TIMESTAMP column in a Postgres table.
         Assumes table_name / column_name are valid identifiers (same assumption as other methods).
@@ -286,11 +390,12 @@ class PostgresConnector(SqlConnector):
 
         conn = self.get_connection()
         cur = conn.cursor()
+        qualified_table = self._qualify_table_sql(table_name, schema)
         try:
             sql = (
-                f'SELECT MIN("{column_name}"), MAX("{column_name}") '
-                f'FROM {table_name} '
-                f'WHERE "{column_name}" IS NOT NULL;'
+                f"SELECT MIN({self._quote_identifier(column_name)}), MAX({self._quote_identifier(column_name)}) "
+                f"FROM {qualified_table} "
+                f"WHERE {self._quote_identifier(column_name)} IS NOT NULL;"
             )
             cur.execute(sql)
             row = cur.fetchone()
@@ -299,9 +404,10 @@ class PostgresConnector(SqlConnector):
             cur.close()
             conn.close()
 
-    def extract_table_schema(self, table_name):
+    def extract_table_schema(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             schema_sql = """
                       SELECT
@@ -356,7 +462,7 @@ class PostgresConnector(SqlConnector):
                     ORDER BY a.attnum;
                 """
 
-            cursor.execute(schema_sql, (self.schema, table_name))
+            cursor.execute(schema_sql, (target_schema, pure_table))
             rows = cursor.fetchall()
 
             result = [
@@ -546,28 +652,28 @@ class PostgresConnector(SqlConnector):
 
 
     
-    def  build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns = []):
+    def build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns=None):
         """
         Generates a PostgreSQL CREATE TABLE statement along with a CREATE INDEX statement
         (for indexed columns) using the provided column metadata.
         """
+        if columns is None:
+            columns = []
+            
         column_defs = []
         primary_keys = []
         index_keys = []
-        # matches func_name(…)  or   schema.func_name(…)
-        fun_call = re.compile(r'^[A-Za-z_][\w\.]*\s*\(.*\)$')
         for col in columns:
             col_name = col["name"]
-            col_type = col["type"].upper()
+            col_type = col["type"]
             length = col.get("length")
             nullable = col["nullable"].strip() == "YES"
-            default = col["default"] or ""
             is_pk = col["primary_key"].strip() == "YES"
             if col['is_index'] == "YES":
                 index_keys.append(col_name)
 
-            # Handle types with length
-            if col_type in ("VARCHAR", "CHAR") and length:
+            # Only append length if it's a string type that doesn't already have it
+            if col_type.upper() in ("VARCHAR", "CHAR") and length and "(" not in col_type:
                 col_type_str = f"{col_type}({length})"
             else:
                 col_type_str = col_type
@@ -578,19 +684,10 @@ class PostgresConnector(SqlConnector):
             if not nullable:
                 col_def_parts.append("NOT NULL")
 
-                # DEFAULT handling
-            if default:
-                d = default
-                # is this a function call?  (unquoted identifier + '(')
-                if not fun_call.match(d):
-                    # it’s either a literal ('…'), numeric (1234), casted literal ('…'::text), etc.
-                    col_def_parts.append(f"DEFAULT {d}")
-                # else: skip it
-
             column_defs.append(" ".join(col_def_parts))
 
-            # if is_pk:
-            #     primary_keys.append(f'"{col_name}"')
+            if is_pk:
+                primary_keys.append(f'"{col_name}"')
 
         # Append primary key constraint
         if primary_keys:
@@ -611,7 +708,6 @@ class PostgresConnector(SqlConnector):
             index_stmt = ";\n".join(index_statements) + ";"
 
         return create_stmt, index_stmt
-
 
     def get_view_columns(self, table_name: str, schema_name: str = 'populations'):
         """
@@ -658,12 +754,19 @@ class PostgresConnector(SqlConnector):
             cur.close()
             conn.close()
 
-    def fetch_deltas(self, cursor, primary_key: str, log_table: str, since_ts: datetime, batch_size: int = 10_000):
+    def fetch_deltas(self, cursor, primary_keys, log_table: str, since_ts: datetime, batch_size: int = 10_000, schema: Optional[str] = None):
+        normalized_primary_keys = self.normalize_primary_keys(primary_keys)
+        qualified_log_table = self._qualify_table_sql(log_table, schema)
+        if not normalized_primary_keys:
+            logger.error("fetch_deltas requires at least one primary key column.")
+            return
+
+        primary_key_sql = ", ".join(self._quote_identifier(pk) for pk in normalized_primary_keys)
         sql = f"""
-            SELECT DISTINCT ON ({primary_key}) *
-            FROM {log_table}
+            SELECT DISTINCT ON ({primary_key_sql}) *
+            FROM {qualified_log_table}
             WHERE Date_operation > %s
-            ORDER BY {primary_key}, 
+            ORDER BY {primary_key_sql}, 
             Date_operation DESC
             LIMIT %s OFFSET %s;
         """
@@ -725,7 +828,7 @@ class PostgresConnector(SqlConnector):
             return None
         
         
-    def truncate_table(self, table_name: str, schema: str = None) -> bool:
+    def truncate_table(self, table_name: str, schema: Optional[str] = None) -> bool:
         """
         Remove all data from the specified table while keeping its structure
         """
@@ -735,15 +838,15 @@ class PostgresConnector(SqlConnector):
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            use_schema = schema if schema else self.schema
-            truncate_sql = f'TRUNCATE TABLE "{use_schema}"."{table_name}"'
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            truncate_sql = f"TRUNCATE TABLE {qualified_table}"
             cursor.execute(truncate_sql)
             conn.commit()
-            logger.info(f"Successfully truncated table: {use_schema}.{table_name}")
+            logger.info(f"Successfully truncated table: {qualified_table}")
             return True
             
         except Exception as e:
-            logger.error(f"Failed to truncate table {use_schema}.{table_name}: {str(e)}")
+            logger.error(f"Failed to truncate table {self.qualify_table_name(table_name, schema)}: {str(e)}")
             if conn:
                 conn.rollback()
             return False
@@ -1048,7 +1151,7 @@ class PostgresConnector(SqlConnector):
                 conn.close()
 
 
-    def get_table_indexes(self, table_name: str) -> List[Dict[str, Any]]:
+    def get_table_indexes(self, table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Return index definitions for a table from PostgreSQL catalogs.
 
@@ -1060,6 +1163,7 @@ class PostgresConnector(SqlConnector):
         """
         conn = self.get_connection()
         cur = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
         try:
             sql = """
             SELECT
@@ -1078,7 +1182,7 @@ class PostgresConnector(SqlConnector):
             GROUP BY i.relname, ix.indisunique, ix.indisprimary
             ORDER BY ix.indisprimary DESC, ix.indisunique DESC, i.relname;
             """
-            cur.execute(sql, (self.schema, table_name))
+            cur.execute(sql, (target_schema, pure_table))
             rows = cur.fetchall()
 
             results: List[Dict[str, Any]] = []
@@ -1096,8 +1200,110 @@ class PostgresConnector(SqlConnector):
             return results
 
         except Exception as e:
-            logger.error(f"Error getting indexes for Postgres table {self.schema}.{table_name}: {e}")
+            logger.error(f"Error getting indexes for Postgres table {self.qualify_table_name(table_name, schema)}: {e}")
             return []
+        finally:
+            cur.close()
+            conn.close()
+
+
+    def _build_stream_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
+        """
+        Build a SELECT clause for full-sync streaming.
+
+        Risky Postgres date/time values are cast to text so psycopg2 does not
+        attempt to coerce out-of-range values into Python datetime objects.
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        risky_types = {
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "time with time zone",
+        }
+
+        try:
+            cur.execute(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                ORDER BY ordinal_position;
+                """,
+                (target_schema, pure_table),
+            )
+
+            select_parts = []
+
+            for column_name, data_type, _udt_name in cur.fetchall():
+                quoted_col = self._quote_identifier(column_name)
+                if data_type in risky_types:
+                    select_parts.append(f"{quoted_col}::text AS {quoted_col}")
+                else:
+                    select_parts.append(quoted_col)
+
+            return ", ".join(select_parts) if select_parts else "*"
+
+        finally:
+            cur.close()
+            conn.close()
+
+    def _build_display_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
+        """
+        Build a SELECT clause suitable for UI display.
+
+        Spatial/PostGIS columns are rendered as readable text instead of EWKB hex.
+        Example:
+            geometry(Point,4326) -> POINT(-7.5898 33.5731)
+        """
+        conn = self.get_connection()
+        cur = conn.cursor()
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        DATE_TIME_TYPES = {
+            "date",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "time with time zone",
+        }
+
+        try:
+            cur.execute(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                AND table_name = %s
+                ORDER BY ordinal_position;
+                """,
+                (target_schema, pure_table),
+            )
+
+            select_parts = []
+
+            for column_name, data_type, udt_name in cur.fetchall():
+                quoted_col = self._quote_identifier(column_name)
+                if data_type == "USER-DEFINED" and udt_name in ("geometry", "geography"):
+                    select_parts.append(
+                        f"ST_AsText({quoted_col}) AS {quoted_col}"
+                    )
+                elif data_type in DATE_TIME_TYPES:
+                    select_parts.append(f"{quoted_col}::text AS {quoted_col}")
+                else:
+                    select_parts.append(quoted_col)
+
+            return ", ".join(select_parts) if select_parts else "*"
+
         finally:
             cur.close()
             conn.close()
