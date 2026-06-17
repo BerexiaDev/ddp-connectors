@@ -1,6 +1,7 @@
 from ddp_connectors.database_connectors.postgres_connector import PostgresConnector
 from ddp_connectors.database_connectors.sql_server_connector import SqlServerConnector
 from ddp_connectors.database_connectors.informix_connector import InformixConnector
+from ddp_connectors.database_connectors.db2i_connector import Db2iConnector
 
 
 class ConnectorFactory():
@@ -28,5 +29,11 @@ class ConnectorFactory():
                                           connector_settings["password"], connector_settings["port"],
                                           connector_settings["database"], connector_settings["protocol"], connector_settings["locale"])
             return connector
-    
+
+        elif connector_type == 'db2i':
+            connector = Db2iConnector(connector_settings["host"], connector_settings["user"],
+                                      connector_settings["password"], connector_settings["port"],
+                                      connector_settings["database"], connector_settings.get("schema"))
+            return connector
+
     
