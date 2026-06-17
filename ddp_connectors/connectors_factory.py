@@ -4,6 +4,7 @@ from ddp_connectors.database_connectors.informix_connector import InformixConnec
 from ddp_connectors.database_connectors.oracle_connector import OracleConnector
 from ddp_connectors.database_connectors.mongo_connector import MongoConnector
 from ddp_connectors.database_connectors.mysql_connector import MySQLConnector
+from ddp_connectors.database_connectors.db2i_connector import Db2iConnector
 
 
 class ConnectorFactory():
@@ -50,3 +51,11 @@ class ConnectorFactory():
                                        connector_settings["password"], connector_settings["port"],
                                        connector_settings["database"])
             return connector
+
+        elif connector_type == 'db2i':
+            connector = Db2iConnector(connector_settings["host"], connector_settings["user"],
+                                      connector_settings["password"], connector_settings["port"],
+                                      connector_settings["database"], connector_settings.get("schema"))
+            return connector
+
+    

@@ -293,6 +293,105 @@ def cast_postgres_to_typescript(data_type: str) -> str:
     return mapping.get(data_type, "any")
 
 
+def cast_db2i_to_typescript_types(sql_type: str) -> str:
+    """
+    Convert a Db2 for IBM i column type (QSYS2.SYSCOLUMNS.DATA_TYPE) to a
+    TypeScript-friendly type using a direct dictionary lookup.
+
+    DATA_TYPE values from the Db2 for i catalog are upper-case (e.g. 'VARCHAR').
+    Unknown or unlisted types fall back to `'any'`.
+    """
+    db2i_to_ts: Dict[str, str] = {
+        # numeric
+        "SMALLINT": "number",
+        "INTEGER": "number",
+        "INT": "number",
+        "BIGINT": "number",
+        "DECIMAL": "number",
+        "NUMERIC": "number",
+        "DECFLOAT": "number",
+        "REAL": "number",
+        "FLOAT": "number",
+        "DOUBLE": "number",
+
+        # textual
+        "CHAR": "string",
+        "CHARACTER": "string",
+        "VARCHAR": "string",
+        "CLOB": "string",
+        "GRAPHIC": "string",
+        "VARGRAPHIC": "string",
+        "DBCLOB": "string",
+        "NCHAR": "string",
+        "NVARCHAR": "string",
+        "NCLOB": "string",
+        "ROWID": "string",
+        "XML": "string",
+
+        # binary / blob
+        "BINARY": "string",
+        "VARBINARY": "string",
+        "BLOB": "string",
+        "DATALINK": "string",
+
+        # temporal
+        "DATE": "Date",
+        "TIME": "string",
+        "TIMESTAMP": "Datetime",
+        "TIMESTMP": "Datetime",
+    }
+
+    return db2i_to_ts.get((sql_type or "").strip().upper(), "any")
+
+
+def cast_db2i_to_postgresql_type(db2i_type: str) -> str:
+    """
+    Map a Db2 for IBM i type (QSYS2.SYSCOLUMNS.DATA_TYPE) to a PostgreSQL type.
+    Unknown or unlisted types fall back to `'TEXT'`.
+    """
+    db2i_to_pg: Dict[str, str] = {
+        # Numerics
+        "SMALLINT": "SMALLINT",
+        "INTEGER": "INTEGER",
+        "INT": "INTEGER",
+        "BIGINT": "BIGINT",
+        "DECIMAL": "NUMERIC",
+        "NUMERIC": "NUMERIC",
+        "DECFLOAT": "NUMERIC",
+        "REAL": "REAL",
+        "FLOAT": "DOUBLE PRECISION",
+        "DOUBLE": "DOUBLE PRECISION",
+
+        # Character / Text
+        "CHAR": "CHAR",
+        "CHARACTER": "CHAR",
+        "VARCHAR": "VARCHAR",
+        "CLOB": "TEXT",
+        "GRAPHIC": "CHAR",
+        "VARGRAPHIC": "VARCHAR",
+        "DBCLOB": "TEXT",
+        "NCHAR": "CHAR",
+        "NVARCHAR": "VARCHAR",
+        "NCLOB": "TEXT",
+        "ROWID": "TEXT",
+        "XML": "XML",
+
+        # Binary / BLOB
+        "BINARY": "BYTEA",
+        "VARBINARY": "BYTEA",
+        "BLOB": "BYTEA",
+        "DATALINK": "TEXT",
+
+        # Temporal
+        "DATE": "DATE",
+        "TIME": "TIME",
+        "TIMESTAMP": "TIMESTAMP",
+        "TIMESTMP": "TIMESTAMP",
+    }
+
+    return db2i_to_pg.get((db2i_type or "").strip().upper(), "TEXT")
+
+
 def cast_sqlserver_to_typescript_types(sql_type: str) -> str:
     """
        Convert an SQL-Server column type to a TypeScript-friendly type

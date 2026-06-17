@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ddp_connectors',
-    version='0.10.0',
+    version='0.0.7',
     packages=find_packages(),
     # Add dependencies here
     install_requires=[
@@ -12,6 +12,8 @@ setup(
         "cx_oracle",
         "mysql-connector-python",
         "loguru",
+        "jaydebeapi",  # Db2 for IBM i (JDBC via JTOpen jt400.jar)
+        "JPype1",      # JVM bridge used by jaydebeapi
     ],
     description='Deepkube Data Platform Global Library',
     author='Berexia DEV Team',

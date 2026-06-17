@@ -63,6 +63,15 @@ Each connector handles the dialect differences internally — pagination syntax,
 - **Encoding:** Handles Latin-1 (ISO-8859-1) for SQL_CHAR and UTF-8 for SQL_WCHAR
 - **Type Mapping:** Translates Informix integer-based column type codes to both TypeScript and PostgreSQL types
 
+### Db2 for IBM i
+
+- **Driver:** `jaydebeapi` with the open-source **JTOpen JDBC driver** (`jt400.jar`) — Db2 for i / Db2/400 on IBM i / AS400. Chosen over the IBM i Access ODBC Driver because `jt400.jar` is freely downloadable (Maven Central / SourceForge) and **not** subject to US export-control gating.
+- **Connection:** JDBC URL `jdbc:as400://<host>/<database>`; the "schema" is an IBM i *library* (passed as the `libraries` URL property). The `jt400.jar` path is read from the `JT400_JAR` env var (set in the service Dockerfiles).
+- **Pagination:** `OFFSET...FETCH FIRST` syntax
+- **Catalog Discovery:** Reads table/column/key metadata from the `QSYS2` system catalog views (`SYSTABLES`, `SYSCOLUMNS`, `SYSCST`, `SYSKEYCST`, `SYSINDEXES`, `SYSKEYS`)
+- **Type Mapping:** Translates Db2-for-i `DATA_TYPE` names to both TypeScript and PostgreSQL types
+- **Runtime requirement:** A JVM must be available (the service images already install Java)
+
 ---
 
 ## Core Capabilities
@@ -110,16 +119,18 @@ The PostgreSQL connector includes an advanced query builder that constructs SQL 
 
 Each connector requires a settings dictionary with connection parameters:
 
-| Parameter    | PostgreSQL | SQL Server | Informix | Description                        |
-|-------------|:----------:|:----------:|:--------:|-------------------------------------|
-| `host`      | Required   | Required   | Required | Database server hostname or IP      |
-| `user`      | Required   | Required   | Required | Authentication username             |
-| `password`  | Required   | Required   | Required | Authentication password             |
-| `port`      | Required   | Required   | Required | Database server port                |
-| `database`  | Required   | Required   | Required | Target database name                |
-| `schema`    | Optional   | -          | -        | PostgreSQL schema (search_path)     |
-| `protocol`  | -          | -          | Required | Informix connection protocol        |
-| `locale`    | -          | -          | Optional | Informix client locale setting      |
+| Parameter    | PostgreSQL | SQL Server | Informix | Db2 for i | Description                        |
+|-------------|:----------:|:----------:|:--------:|:---------:|-------------------------------------|
+| `host`      | Required   | Required   | Required | Required  | DB server hostname/IP (IBM i system name for Db2 for i) |
+| `user`      | Required   | Required   | Required | Required  | Authentication username             |
+| `password`  | Required   | Required   | Required | Required  | Authentication password             |
+| `port`      | Required   | Required   | Required | Required  | Database server port (ignored for Db2-for-i ODBC) |
+| `database`  | Required   | Required   | Required | Required  | Target database name (RDB name for Db2 for i) |
+| `schema`    | Optional   | -          | -        | Optional  | PostgreSQL schema (search_path) / Db2-for-i library |
+| `protocol`  | -          | -          | Required | -         | Informix connection protocol        |
+| `locale`    | -          | -          | Optional | -         | Informix client locale setting      |
+
+Use connector `type` = `db2i` for Db2 for IBM i.
 
 ---
 
@@ -133,6 +144,7 @@ ddp_connectors/
         postgres_connector.py          # PostgreSQL implementation
         sql_server_connector.py        # SQL Server implementation
         informix_connector.py          # IBM Informix implementation
+        db2i_connector.py              # Db2 for IBM i implementation
         sql_connector_utils.py         # Type mapping and conversion utilities
         utils/
             enums.py                   # Query building enumerations
@@ -145,11 +157,15 @@ ddp_connectors/
 
 | Package      | Purpose                                      |
 |-------------|----------------------------------------------|
-| `pyodbc`    | SQL Server and Informix database connections  |
+| `pyodbc`    | SQL Server and Informix connections           |
 | `psycopg2`  | PostgreSQL database connections               |
+| `jaydebeapi` | Db2 for IBM i connections (JDBC via JTOpen)  |
+| `JPype1`    | JVM bridge used by `jaydebeapi`               |
 | `sqlalchemy` | SQL type mapping and handling                |
 | `cx_oracle`  | Oracle database connections (reserved)       |
 | `loguru`     | Structured logging                           |
+
+> Db2 for IBM i also needs `jt400.jar` (the JTOpen driver) on disk and a JVM available. The service Dockerfiles set `JT400_JAR` to its vendored location under `app/main/drivers/`.
 
 ---
 
