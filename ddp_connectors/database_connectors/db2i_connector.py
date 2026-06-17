@@ -45,12 +45,22 @@ class Db2iConnector(SqlConnector):
             "JT400_JAR", "/usr/src/app/app/main/drivers/jt400.jar"
         )
 
+    def _effective_schema(self) -> str:
+        """
+        The IBM i library to use. On Db2 for i there is no separate "database" the way
+        Postgres has one — the host IS the system and the path/`libraries` property sets
+        the default library. Accept the library from either `schema` or `database` so it
+        works regardless of which UI field the user filled.
+        """
+        return (self.schema or self.database or "").strip()
+
     def _qualify(self, table_name: str) -> str:
-        """Qualify a bare table name with the configured schema/library if needed."""
+        """Qualify a bare table name with the configured library if needed."""
         if not table_name:
             return table_name
-        if self.schema and "." not in table_name:
-            return f'"{self.schema}"."{table_name}"'
+        lib = self._effective_schema()
+        if lib and "." not in table_name:
+            return f'"{lib}"."{table_name}"'
         return table_name
 
     def get_connection(self):
@@ -59,18 +69,19 @@ class Db2iConnector(SqlConnector):
         # other connectors) even when jaydebeapi/JPype1 are not installed.
         import jaydebeapi
 
-        # Build the JDBC URL. The default schema/library and a few sensible properties
-        # are passed as URL properties. See JTOpen JDBC properties for the full list.
-        url = f"jdbc:as400://{self.host}/{self.database}"
+        # Build the JDBC URL in the same shape DBeaver uses for Db2 for i:
+        #   jdbc:as400://<host>;libraries=<lib>;prompt=false
+        # The host alone identifies the IBM i system; there is no "/<database>" path
+        # segment. The library is passed via the `libraries` property.
         props = ["prompt=false"]
-        if self.schema:
-            # Sets both the default schema for unqualified names and the library list.
-            props.append(f"libraries={self.schema}")
+        lib = self._effective_schema()
+        if lib:
+            props.append(f"libraries={lib}")
         if self.port:
-            # Optional: override the default DRDA port (446) if a custom one is given.
+            # Optional: override the default DRDA port (446) only if one is given.
             props.append(f"portNumber={self.port}")
-        if props:
-            url = f"{url};" + ";".join(props)
+
+        url = f"jdbc:as400://{self.host};" + ";".join(props)
 
         return jaydebeapi.connect(
             _JT400_DRIVER_CLASS,
@@ -155,12 +166,13 @@ class Db2iConnector(SqlConnector):
     def get_connection_tables(self):
         conn = self.get_connection()
         cursor = conn.cursor()
+        lib = self._effective_schema()
         try:
-            if self.schema:
+            if lib:
                 cursor.execute(
                     "SELECT TABLE_NAME FROM QSYS2.SYSTABLES "
                     "WHERE TABLE_TYPE = 'T' AND TABLE_SCHEMA = ?",
-                    [self.schema],
+                    [lib],
                 )
             else:
                 cursor.execute(
@@ -185,9 +197,10 @@ class Db2iConnector(SqlConnector):
                 "WHERE TABLE_NAME = ?"
             )
             params = [table_name]
-            if self.schema:
+            lib = self._effective_schema()
+            if lib:
                 sql += " AND TABLE_SCHEMA = ?"
-                params.append(self.schema)
+                params.append(lib)
             sql += " ORDER BY ORDINAL_POSITION"
 
             cursor.execute(sql, params)
@@ -240,8 +253,9 @@ class Db2iConnector(SqlConnector):
     def extract_table_schema(self, table_name):
         conn = self.get_connection()
         cursor = conn.cursor()
+        lib = self._effective_schema()
         try:
-            schema_filter = "AND c.TABLE_SCHEMA = ?" if self.schema else ""
+            schema_filter = "AND c.TABLE_SCHEMA = ?" if lib else ""
             sql = f"""
                 SELECT
                     c.ORDINAL_POSITION,
@@ -285,8 +299,8 @@ class Db2iConnector(SqlConnector):
                 ORDER BY c.ORDINAL_POSITION
             """
             params = [table_name]
-            if self.schema:
-                params.append(self.schema)
+            if lib:
+                params.append(lib)
 
             cursor.execute(sql, params)
             rows = cursor.fetchall()
@@ -386,7 +400,7 @@ class Db2iConnector(SqlConnector):
             if "." in t:
                 s, tb = t.split(".", 1)
                 return s.strip(), tb.strip()
-            return (self.schema or "").strip(), t.strip()
+            return self._effective_schema(), t.strip()
 
         schema_name, pure_table = _split_schema_table(table_name)
 
