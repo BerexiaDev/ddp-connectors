@@ -13,15 +13,17 @@ from bson.decimal128 import Decimal128
 from bson.codec_options import TypeCodec, TypeRegistry, CodecOptions
 from decimal import Decimal
 
-# Maps the normalized BSON/JSON types produced by schema inference onto the
-# coarse-grained column types the rest of the platform's UI / rule engine speaks.
+# Maps the inferred BSON/JSON types onto the SMALL UI-facing type vocabulary the rest of
+# the platform speaks (ColumnTypeEnum in ddp-ui: string/number/boolean/Date/Datetime/
+# list/record/...). These exact tokens are what the column editor and rule builder render;
+# anything outside this set shows up as a blank type tag, so keep it aligned.
 PLATFORM_TYPE_MAP = {
     "string": "string",
-    "integer": "integer",
-    "double": "double",
-    "decimal": "decimal",
+    "integer": "number",
+    "double": "number",
+    "decimal": "number",
     "boolean": "boolean",
-    "date": "date",
+    "date": "Datetime",   # BSON dates carry a time component
     "object": "record",
     "array": "list",
     "objectId": "string",
@@ -237,7 +239,9 @@ class MongoConnector:
                 columns.append({
                     "name": path,
                     "alias": path,
-                    "type": PLATFORM_TYPE_MAP.get(field["dominant_type"], "string"),
+                    # Type off the dominant NON-NULL type so a mostly-null field still shows
+                    # its real type (and stays consistent with the storage column type).
+                    "type": PLATFORM_TYPE_MAP.get(self._effective_type(field), "string"),
                     "presence_pct": field["presence_pct"],
                     "nullable": field["nullable"],
                     "polymorphic": field["polymorphic"],
@@ -577,16 +581,35 @@ class MongoConnector:
         return columns
 
     @staticmethod
+    def _effective_type(field: Dict[str, Any]) -> str:
+        """The field's dominant NON-NULL inferred type (ignoring how often it is null).
+
+        ``types`` is ordered most-common-first, so the first non-null entry is the
+        dominant real type. Falls back to the raw dominant type only if every value is null.
+        """
+        for t in field.get("types", []):
+            if t["type"] != "null":
+                return t["type"]
+        return field["dominant_type"]
+
+    @staticmethod
     def _postgres_type_for(field: Dict[str, Any]) -> str:
-        """Pick the destination column type for an inferred top-level field."""
+        """Pick the destination column type for an inferred top-level field.
+
+        Driven by the observed NON-NULL types, so a mostly-null field still gets its real
+        type (e.g. a date that is null in 70% of docs is still a TIMESTAMP, not TEXT).
+        """
         non_null_types = [t["type"] for t in field.get("types", []) if t["type"] != "null"]
+        # Only ever seen null => nothing to type on; keep it as TEXT.
+        if not non_null_types:
+            return "TEXT"
         # Nested object/array anywhere => JSONB.
         if "object" in non_null_types or "array" in non_null_types:
             return "JSONB"
         # Mixed scalar types across documents => widen to TEXT so inserts never fail.
         if len(set(non_null_types)) > 1:
             return "TEXT"
-        return POSTGRES_TYPE_MAP.get(field["dominant_type"], "TEXT")
+        return POSTGRES_TYPE_MAP.get(non_null_types[0], "TEXT")
 
     def _project_document(self, doc: Dict[str, Any], schema: List[Dict[str, Any]]) -> tuple:
         """
