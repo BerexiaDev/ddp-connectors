@@ -1,4 +1,5 @@
 
+from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import islice
 import json
@@ -6,9 +7,25 @@ from loguru import logger
 from typing import Dict, Any, List, Tuple
 from pymongo import MongoClient
 
+from bson import ObjectId
 from bson.decimal128 import Decimal128
 from bson.codec_options import TypeCodec, TypeRegistry, CodecOptions
 from decimal import Decimal
+
+# Maps the normalized BSON/JSON types produced by schema inference onto the
+# coarse-grained column types the rest of the platform's UI / rule engine speaks.
+PLATFORM_TYPE_MAP = {
+    "string": "string",
+    "integer": "integer",
+    "double": "double",
+    "decimal": "decimal",
+    "boolean": "boolean",
+    "date": "date",
+    "object": "record",
+    "array": "list",
+    "objectId": "string",
+    "null": "string",
+}
 
 class DecimalCodec(TypeCodec):
     python_type = Decimal    # When PyMongo sees a Python Decimal
@@ -164,26 +181,247 @@ class MongoConnector:
         finally:
             client.close()
 
-    def get_connection_columns(self, table_name: str) -> List[Dict[str, str]]:
+    # Documents collapsed into the (id, data) storage contract used by the sync
+    # pipeline. Returned as a safe fallback whenever live schema inference can't run.
+    _FALLBACK_COLUMNS = [
+        {"name": "id", "type": "string", "alias": "id"},
+        {"name": "data", "type": "record", "alias": "data"},
+    ]
+
+    def get_connection_columns(self, table_name: str, sample_size: int = 1000) -> List[Dict[str, Any]]:
         """
-        MongoDB is schema-less. This infers 'columns' (keys) by sampling the first document.
+        MongoDB is schema-less, so there is no fixed column list. This samples documents
+        and returns the *top-level* fields actually observed in the collection, each
+        annotated with its presence rate and type distribution.
+
+        Because the same collection can hold heterogeneous documents (field exists in
+        document A but not B, or has different types), every column carries:
+          - presence_pct : % of sampled docs in which the field is present at all
+          - nullable     : True if the field is ever absent or null
+          - polymorphic  : True if the field appears with more than one type
+          - types        : the full observed type distribution
+
+        Falls back to the (id, data) storage contract if the collection is empty or
+        sampling fails, so existing callers keep working.
         """
         try:
-            return [
-                {
-                    "name": "id",
-                    "type": "string",
-                    "alias": "id",
-                },
-                {
-                    "name": "data",
-                    "type": "record",
-                    "alias": "data",
-                },
-            ]
+            catalog = self.profile_collection_schema(table_name, sample_size=sample_size)
+            fields = catalog.get("fields", [])
+
+            columns = []
+            for field in fields:
+                path = field["path"]
+                # Only surface top-level scalar/record fields as columns; nested and
+                # array-element paths (containing "." or "[]") live inside the catalog.
+                if "." in path or "[]" in path:
+                    continue
+                columns.append({
+                    "name": path,
+                    "alias": path,
+                    "type": PLATFORM_TYPE_MAP.get(field["dominant_type"], "string"),
+                    "presence_pct": field["presence_pct"],
+                    "nullable": field["nullable"],
+                    "polymorphic": field["polymorphic"],
+                    "types": field["types"],
+                })
+
+            return columns or list(self._FALLBACK_COLUMNS)
         except Exception as e:
-            logger.error(f"Error getting columns: {e}")
-            return []
+            logger.error(f"Error inferring columns for {table_name}, using fallback: {e}")
+            return list(self._FALLBACK_COLUMNS)
+
+    def profile_collection_schema(self, table_name: str, sample_size: int = 1000) -> Dict[str, Any]:
+        """
+        Best-practice probabilistic schema discovery for a schema-less collection.
+
+        Randomly samples up to ``sample_size`` documents (via ``$sample`` so the result
+        is representative, not just the first N inserts) and builds a *field catalog*:
+        every field path observed anywhere in the collection — including nested object
+        paths (``user.address.city``) and array-element paths (``orders[]``) — together
+        with how often it is present, whether it is ever null/absent, and the full
+        distribution of types it takes.
+
+        This is the primitive the field picker, profiler and quality-rule suggester all
+        build on. It is intentionally read-only and does not change how data is synced.
+
+        Returns::
+
+            {
+              "collection": "<name>",
+              "sampled": <int>,            # number of documents actually sampled
+              "fields": [ { ...catalog entry... }, ... ]
+            }
+        """
+        client = self.get_connection()
+        try:
+            db = client[self.database_name]
+            collection = db[table_name]
+            try:
+                docs = list(collection.aggregate(
+                    [{"$sample": {"size": sample_size}}], allowDiskUse=True
+                ))
+            except Exception as exc:
+                # $sample needs a non-empty collection / certain storage engines; fall
+                # back to a plain bounded scan.
+                logger.warning(f"$sample failed for {table_name} ({exc}); falling back to find().limit()")
+                docs = list(collection.find().limit(sample_size))
+
+            fields = self._infer_field_catalog(docs)
+            logger.info(f"Inferred {len(fields)} field paths from {len(docs)} sampled docs in {table_name}")
+            return {"collection": table_name, "sampled": len(docs), "fields": fields}
+        finally:
+            client.close()
+
+    def _infer_field_catalog(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Pure inference over a list of sampled documents -> field catalog.
+
+        Kept free of any network/IO so it can be unit-tested directly and reasoned about.
+        Presence is counted once per document (so a field inside a 50-element array still
+        counts as "present in 1 doc"), while the type distribution counts every occurrence
+        (so type polymorphism inside arrays is still detected).
+        """
+        total = len(docs)
+        type_counts: Dict[str, Counter] = defaultdict(Counter)
+        null_counts: Dict[str, int] = defaultdict(int)
+        present_docs: Dict[str, int] = defaultdict(int)
+        examples: Dict[str, list] = defaultdict(list)
+
+        for doc in docs:
+            seen: set = set()
+            self._walk_document(doc, "", seen, type_counts, null_counts, examples)
+            for path in seen:
+                present_docs[path] += 1
+
+        fields = []
+        for path in sorted(type_counts.keys()):
+            counts = type_counts[path]
+            occurrences = sum(counts.values())
+            present = present_docs[path]
+            distribution = [
+                {"type": t, "pct": round(c * 100 / occurrences, 1)}
+                for t, c in counts.most_common()
+            ]
+            fields.append({
+                "path": path,
+                "presence_pct": round(present * 100 / total, 1) if total else 0.0,
+                "null_pct": round(null_counts[path] * 100 / total, 1) if total else 0.0,
+                # Absent in some docs OR explicitly null => not a guaranteed field.
+                "nullable": present < total or null_counts[path] > 0,
+                "dominant_type": counts.most_common(1)[0][0],
+                "polymorphic": len([t for t in counts if t != "null"]) > 1,
+                "types": distribution,
+                "examples": examples[path][:3],
+            })
+        return fields
+
+    def _walk_document(self, value, path, seen, type_counts, null_counts, examples) -> None:
+        """Recursively record the type/presence of every field path within a document."""
+        if path != "":
+            type_counts[path][self._normalize_type(value)] += 1
+            seen.add(path)
+            if value is None:
+                null_counts[path] += 1
+
+        if isinstance(value, dict):
+            for key, child_value in value.items():
+                child_path = f"{path}.{key}" if path else key
+                self._walk_document(child_value, child_path, seen, type_counts, null_counts, examples)
+        elif isinstance(value, list):
+            child_path = f"{path}[]"
+            for item in value:
+                self._walk_document(item, child_path, seen, type_counts, null_counts, examples)
+        elif path != "" and value is not None and len(examples[path]) < 3:
+            examples[path].append(self._safe_example(value))
+
+    @staticmethod
+    def _normalize_type(value) -> str:
+        """Map a Python/BSON value onto a stable, JSON-friendly type name."""
+        if value is None:
+            return "null"
+        # bool is a subclass of int, so it must be checked first.
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "double"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, datetime):
+            return "date"
+        if isinstance(value, ObjectId):
+            return "objectId"
+        if isinstance(value, (Decimal, Decimal128)):
+            return "decimal"
+        if isinstance(value, dict):
+            return "object"
+        if isinstance(value, list):
+            return "array"
+        return type(value).__name__
+
+    @staticmethod
+    def _safe_example(value):
+        """Keep JSON-native scalars as-is; stringify anything else (ObjectId, Decimal128...)."""
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def suggest_quality_checks(
+        self,
+        catalog: Dict[str, Any],
+        present_threshold: float = 80.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Turn an inferred field catalog into a list of *suggested* declarative quality
+        checks — the "profile -> suggest -> confirm" pattern the leading platforms use,
+        instead of making the user hand-write rules from scratch.
+
+        Two high-signal check types fall straight out of schema-less data and have no
+        relational equivalent:
+
+          - field_presence : a field present in most-but-not-all docs is a likely
+                             "should always be there" field whose absences are defects.
+          - type_consistency : a field that is overwhelmingly one type but occasionally
+                             another (e.g. amount: number 98% / string 2%) is drifting.
+
+        Returns suggestions only — nothing is persisted or executed here.
+        """
+        suggestions = []
+        for field in catalog.get("fields", []):
+            path = field["path"]
+            presence = field["presence_pct"]
+            types = field["types"]
+
+            # Mostly-present-but-not-always => candidate required field.
+            if present_threshold <= presence < 100.0:
+                suggestions.append({
+                    "check": "field_presence",
+                    "field": path,
+                    "params": {"min_presence_pct": round(presence, 0)},
+                    "severity": "WARNING",
+                    "rationale": (
+                        f"'{path}' is present in {presence}% of sampled documents — "
+                        f"the missing {round(100 - presence, 1)}% may be defects."
+                    ),
+                })
+
+            # Mixed types for one field (ignoring null) => candidate type drift.
+            non_null = [t for t in types if t["type"] != "null"]
+            if len(non_null) > 1:
+                dominant = non_null[0]
+                minority = ", ".join(f"{t['type']} {t['pct']}%" for t in non_null[1:])
+                suggestions.append({
+                    "check": "type_consistency",
+                    "field": path,
+                    "params": {"expected_type": dominant["type"]},
+                    "severity": "URGENT",
+                    "rationale": (
+                        f"'{path}' is dominantly {dominant['type']} ({dominant['pct']}%) "
+                        f"but also appears as {minority}."
+                    ),
+                })
+        return suggestions
 
     def count_table_rows(self, table_name: str) -> int:
         client = self.get_connection()
@@ -218,10 +456,16 @@ class MongoConnector:
 
     def extract_table_schema(self, table_name: str) -> List[Dict[str, Any]]:
         """
-        Extracts the schema by finding the documents with the highest number of fields.
-        This provides a highly accurate schema without the performance penalty of unwinding the whole collection.
+        Storage contract for the sync pipeline, NOT a discovery method.
+
+        The sync pipeline lands every document into a two-column relational table:
+        ``id`` (the stringified _id) and ``data`` (the whole document as JSONB). This
+        method describes that physical landing schema and is deliberately fixed.
+
+        For real, document-aware schema *discovery* (per-field presence and type
+        distribution across heterogeneous documents) use ``profile_collection_schema``.
         """
-        
+
         return [
             {
                 "position": 0, 
