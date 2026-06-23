@@ -27,6 +27,25 @@ PLATFORM_TYPE_MAP = {
     "null": "string",
 }
 
+# Maps inferred field types onto destination (PostgreSQL data-mart) column types.
+# Nested objects/arrays are stored as JSONB; everything else lands in a typed column.
+POSTGRES_TYPE_MAP = {
+    "string": "TEXT",
+    "integer": "BIGINT",
+    "double": "DOUBLE PRECISION",
+    "decimal": "NUMERIC",
+    "boolean": "BOOLEAN",
+    "date": "TIMESTAMP",
+    "objectId": "TEXT",
+    "object": "JSONB",
+    "array": "JSONB",
+    "null": "TEXT",
+}
+
+# Column that captures any top-level field NOT present in the sampled schema, so a
+# rare/late-appearing field is never silently dropped during sync (schema-drift safety).
+EXTRA_COLUMN = "_extra"
+
 class DecimalCodec(TypeCodec):
     python_type = Decimal    # When PyMongo sees a Python Decimal
     bson_type = Decimal128   # it should convert it to a Mongo Decimal128
@@ -49,6 +68,11 @@ class MongoConnector:
         self.port = port
         self.database_name = database
         self.driver = "mongodb"
+        # Caches the inferred relational schema per collection so that
+        # extract_table_schema() (used to build the table DDL + INSERT columns) and
+        # stream_batch()/fetch_batch() (which must yield rows in the SAME column order)
+        # never disagree within a single sync run.
+        self._relational_schema_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def ping(self) -> bool:
         """
@@ -114,15 +138,9 @@ class MongoConnector:
         client = self.get_connection()
         try:
             db = client[self.database_name]
+            schema = self._relational_schema(table_name)
             cursor = db[table_name].find().skip(offset).limit(limit)
-            dumps = json.dumps
-            to_str = str 
-            
-            # 2. Use a C-optimized list comprehension to process the cursor
-            return [
-                (to_str(doc.get("_id", "")), dumps(doc, default=to_str))
-                for doc in cursor
-            ]
+            return [self._project_document(doc, schema) for doc in cursor]
         except Exception as e:
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
             return []
@@ -131,36 +149,32 @@ class MongoConnector:
 
     def stream_batch(self, table_name: str, batch_size: int = 10_000):
         """
-        Streaming for MongoDB using a cursor.
-        If as_dict=True, yields batches of raw dictionaries.
-        If as_dict=False, yields batches of (id_string, document_json_string) tuples for fast Postgres inserts.
+        Streams a collection as batches of row tuples ready for Postgres insertion.
+
+        Each document is projected onto the promoted-column schema from
+        ``extract_table_schema`` (top-level fields as typed columns, nested data as JSONB,
+        unmodeled fields in ``_extra``) so the tuples line up positionally with the
+        INSERT column list the sync pipeline builds.
         """
         client = self.get_connection()
         try:
             logger.info(f"Start streaming MongoDB collection {table_name} with batch_size={batch_size}")
             db = client[self.database_name]
-            
+            schema = self._relational_schema(table_name)
+
             # batch_size tells the MongoDB driver how many documents to fetch per network round trip
             cursor = db[table_name].find(batch_size=batch_size)
-            
-            # Performance aliases for the inner loop
-            dumps = json.dumps
-            to_str = str
-            
+
             while True:
                 # 1. Grab exactly batch_size items directly from the cursor
                 chunk = list(islice(cursor, batch_size))
-                
+
                 # If the chunk is empty, we've reached the end of the collection
                 if not chunk:
                     break
                 else:
-                    # Yield the highly optimized tuple batch instantly
-                    yield [
-                        (to_str(doc.get("_id", "")), dumps(doc, default=to_str))
-                        for doc in chunk
-                    ]
-                    
+                    yield [self._project_document(doc, schema) for doc in chunk]
+
             logger.info(f"Finished streaming MongoDB collection {table_name}")
         except Exception as exc:
             logger.error(f"Error streaming batch from MongoDB collection {table_name}: {exc}")
@@ -454,17 +468,158 @@ class MongoConnector:
         finally:
             client.close()
 
+    # Two-column shape used only as a last-resort fallback when a collection is empty
+    # or schema inference fails, so the sync pipeline still has a valid table to target.
+    _FALLBACK_TABLE_SCHEMA = [
+        {"position": 0, "name": "_id", "type": "TEXT", "length": None, "nullable": "NO",
+         "default": None, "primary_key": "YES", "foreign_key": "NO", "is_index": "NO"},
+        {"position": 1, "name": "data", "type": "JSONB", "length": None, "nullable": "YES",
+         "default": None, "primary_key": "NO", "foreign_key": "NO", "is_index": "NO"},
+    ]
+
     def extract_table_schema(self, table_name: str) -> List[Dict[str, Any]]:
         """
-        Storage contract for the sync pipeline, NOT a discovery method.
+        Relational landing schema for a collection, derived from its *actual* documents.
 
-        The sync pipeline lands every document into a two-column relational table:
-        ``id`` (the stringified _id) and ``data`` (the whole document as JSONB). This
-        method describes that physical landing schema and is deliberately fixed.
+        Instead of collapsing every document into ``(id, data)``, this promotes each
+        TOP-LEVEL field to its own typed column and keeps nested objects/arrays as JSONB:
 
-        For real, document-aware schema *discovery* (per-field presence and type
-        distribution across heterogeneous documents) use ``profile_collection_schema``.
+          - top-level scalar (string/number/bool/date/_id) -> a typed column, stored as-is
+          - top-level object or array                      -> a single JSONB column
+          - any top-level field NOT seen while sampling     -> folded into ``_extra`` JSONB
+
+        A field that appears with more than one scalar type across documents is widened to
+        TEXT so heterogeneous documents never break the insert. The result is memoized so
+        that stream_batch()/fetch_batch() project rows in the exact same column order.
+
+        Falls back to the legacy ``(id, data)`` shape if the collection is empty or
+        sampling fails.
         """
+        return self._relational_schema(table_name)
+
+    def _relational_schema(self, table_name: str, sample_size: int = 1000) -> List[Dict[str, Any]]:
+        """Build (and cache) the promoted-column schema for a collection."""
+        if table_name in self._relational_schema_cache:
+            return self._relational_schema_cache[table_name]
+
+        try:
+            catalog = self.profile_collection_schema(table_name, sample_size=sample_size)
+            schema = self._relational_schema_from_catalog(catalog)
+        except Exception as exc:
+            logger.error(f"Failed to infer relational schema for {table_name}, using fallback: {exc}")
+            schema = list(self._FALLBACK_TABLE_SCHEMA)
+
+        self._relational_schema_cache[table_name] = schema
+        return schema
+
+    @classmethod
+    def _relational_schema_from_catalog(cls, catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Pure transform: field catalog -> ordered list of relational column definitions.
+
+        Kept IO-free so it can be unit-tested. ``_id`` is always the first column and the
+        primary key; ``_extra`` is always the last column (drift overflow). Column order is
+        deterministic (``_id``, then top-level fields sorted by name, then ``_extra``) so
+        the DDL and the streamed rows are guaranteed to line up.
+        """
+        # Only top-level fields become columns (skip nested "a.b" and array "a[]" paths).
+        top_level = {
+            f["path"]: f for f in catalog.get("fields", [])
+            if "." not in f["path"] and "[]" not in f["path"]
+        }
+        if not top_level:
+            return list(cls._FALLBACK_TABLE_SCHEMA)
+
+        columns: List[Dict[str, Any]] = []
+
+        # _id first, as primary key (drop it from the field map; it is handled explicitly).
+        top_level.pop("_id", None)
+        columns.append({
+            "position": 0, "name": "_id", "type": "TEXT", "length": None,
+            "nullable": "NO", "default": None, "primary_key": "YES",
+            "foreign_key": "NO", "is_index": "NO",
+        })
+
+        for name in sorted(top_level):
+            field = top_level[name]
+            columns.append({
+                "position": len(columns),
+                "name": name,
+                "type": cls._postgres_type_for(field),
+                "length": None,
+                # Always nullable: a sample can't prove a field is present in EVERY document
+                # of the collection, so NOT NULL would risk failing inserts on later docs.
+                # (Presence/required-ness is still surfaced for quality rules via the catalog.)
+                "nullable": "YES",
+                "default": None,
+                "primary_key": "NO",
+                "foreign_key": "NO",
+                "is_index": "NO",
+            })
+
+        # Overflow column for any top-level field not captured by the sample.
+        columns.append({
+            "position": len(columns), "name": EXTRA_COLUMN, "type": "JSONB", "length": None,
+            "nullable": "YES", "default": None, "primary_key": "NO",
+            "foreign_key": "NO", "is_index": "NO",
+        })
+        return columns
+
+    @staticmethod
+    def _postgres_type_for(field: Dict[str, Any]) -> str:
+        """Pick the destination column type for an inferred top-level field."""
+        non_null_types = [t["type"] for t in field.get("types", []) if t["type"] != "null"]
+        # Nested object/array anywhere => JSONB.
+        if "object" in non_null_types or "array" in non_null_types:
+            return "JSONB"
+        # Mixed scalar types across documents => widen to TEXT so inserts never fail.
+        if len(set(non_null_types)) > 1:
+            return "TEXT"
+        return POSTGRES_TYPE_MAP.get(field["dominant_type"], "TEXT")
+
+    def _project_document(self, doc: Dict[str, Any], schema: List[Dict[str, Any]]) -> tuple:
+        """
+        Turn one document into a row tuple matching ``schema`` column order.
+
+        Scalars are passed through natively (psycopg2 adapts them to the typed column);
+        objects/arrays and anything destined for a JSONB column are serialized to JSON;
+        unmodeled top-level fields are gathered into ``_extra``.
+        """
+        modeled = {c["name"] for c in schema}
+        row = []
+        for col in schema:
+            name = col["name"]
+            if name == "_id":
+                row.append(str(doc.get("_id", "")))
+            elif name == EXTRA_COLUMN:
+                extra = {k: v for k, v in doc.items() if k not in modeled}
+                row.append(json.dumps(extra, default=str) if extra else None)
+            else:
+                value = doc.get(name, None)
+                if value is None:
+                    row.append(None)
+                elif col["type"] == "JSONB" or isinstance(value, (dict, list)):
+                    # JSONB column, or a nested value landing in a TEXT column after drift.
+                    row.append(json.dumps(value, default=str))
+                else:
+                    row.append(self._coerce_scalar(value))
+        return tuple(row)
+
+    @staticmethod
+    def _coerce_scalar(value):
+        """
+        Make a scalar safe for a typed Postgres column.
+
+        psycopg2 only adapts native Python types (str/int/float/bool/datetime/Decimal),
+        not BSON types. Decimal128 is converted to Decimal so it fits a NUMERIC column;
+        any other exotic BSON value (ObjectId, Binary, Timestamp, Regex, UUID, ...) is
+        stringified so it lands cleanly in its TEXT column instead of crashing the insert.
+        """
+        if value is None or isinstance(value, (str, int, float, bool, datetime, Decimal)):
+            return value
+        if isinstance(value, Decimal128):
+            return value.to_decimal()
+        return str(value)
 
         return [
             {
