@@ -3,6 +3,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import islice
 import json
+import uuid
 from loguru import logger
 from typing import Dict, Any, List, Tuple
 from pymongo import MongoClient
@@ -24,6 +25,8 @@ PLATFORM_TYPE_MAP = {
     "object": "record",
     "array": "list",
     "objectId": "string",
+    "binary": "string",
+    "uuid": "string",
     "null": "string",
 }
 
@@ -37,6 +40,8 @@ POSTGRES_TYPE_MAP = {
     "boolean": "BOOLEAN",
     "date": "TIMESTAMP",
     "objectId": "TEXT",
+    "binary": "BYTEA",
+    "uuid": "UUID",
     "object": "JSONB",
     "array": "JSONB",
     "null": "TEXT",
@@ -366,6 +371,12 @@ class MongoConnector:
             return "date"
         if isinstance(value, ObjectId):
             return "objectId"
+        if isinstance(value, uuid.UUID):
+            return "uuid"
+        # bson.Binary is a subclass of bytes; UUID subtype-4 binaries also surface here
+        # under legacy uuid representations.
+        if isinstance(value, (bytes, bytearray)):
+            return "binary"
         if isinstance(value, (Decimal, Decimal128)):
             return "decimal"
         if isinstance(value, dict):
@@ -596,11 +607,19 @@ class MongoConnector:
                 row.append(json.dumps(extra, default=str) if extra else None)
             else:
                 value = doc.get(name, None)
+                col_type = col["type"]
                 if value is None:
                     row.append(None)
-                elif col["type"] == "JSONB" or isinstance(value, (dict, list)):
+                elif col_type == "JSONB" or isinstance(value, (dict, list)):
                     # JSONB column, or a nested value landing in a TEXT column after drift.
                     row.append(json.dumps(value, default=str))
+                elif col_type == "BYTEA" and isinstance(value, (bytes, bytearray)):
+                    # psycopg2 adapts bytes -> bytea natively; keep it lossless.
+                    row.append(bytes(value))
+                elif col_type == "UUID":
+                    # Pass as text so Postgres casts '...'::uuid; avoids needing
+                    # psycopg2.extras.register_uuid() in the sync layer.
+                    row.append(str(value))
                 else:
                     row.append(self._coerce_scalar(value))
         return tuple(row)
