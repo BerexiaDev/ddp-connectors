@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -11,6 +11,7 @@ from .sql_connector_utils import (
     safe_convert_to_string,
     cast_db2i_to_typescript_types,
     cast_db2i_to_postgresql_type,
+    normalize_ui_column_type,
 )
 
 # JDBC driver class shipped inside jt400.jar (the open-source JTOpen / IBM Toolbox
@@ -45,23 +46,40 @@ class Db2iConnector(SqlConnector):
             "JT400_JAR", "/usr/src/app/app/main/drivers/jt400.jar"
         )
 
-    def _effective_schema(self) -> str:
+    def _lib(self, override: Optional[str] = None) -> str:
         """
-        The IBM i library to use. On Db2 for i there is no separate "database" the way
-        Postgres has one — the host IS the system and the path/`libraries` property sets
-        the default library. Accept the library from either `schema` or `database` so it
-        works regardless of which UI field the user filled.
-        """
-        return (self.schema or self.database or "").strip()
+        The IBM i library to use, upper-cased. On Db2 for i there is no separate
+        "database" the way Postgres has one — the host IS the system and the
+        `libraries` property sets the default library. Accept the library from the
+        explicit override (e.g. the UI schema selector), else `schema`, else
+        `database`, so it works regardless of which field the user filled.
 
-    def _qualify(self, table_name: str) -> str:
-        """Qualify a bare table name with the configured library if needed."""
+        Library names on IBM i are stored upper-case in the QSYS2 catalog, and the
+        API lower-cases `database` on save, so we upper-case here to match reliably.
+        """
+        return (override or self.schema or self.database or "").strip().upper()
+
+    def _split_schema_table(self, table_name: str, schema: Optional[str] = None) -> Tuple[str, str]:
+        """
+        Resolve (library, table) from a possibly-qualified name. Accepts "LIB.TABLE"
+        or a bare "TABLE" (with the library taken from the schema arg / config). Both
+        parts are upper-cased to match the QSYS2 catalog (IBM i stores system/DDS
+        names upper-case, and the API lower-cases identifiers on save).
+        """
+        raw = (table_name or "").strip().replace('"', "")
+        if "." in raw:
+            lib, pure = raw.split(".", 1)
+            return lib.strip().upper(), pure.strip().upper()
+        return self._lib(schema), raw.upper()
+
+    def _qualify(self, table_name: str, schema: Optional[str] = None) -> str:
+        """Qualify a table name as "LIB"."TABLE", upper-casing both parts for IBM i."""
         if not table_name:
             return table_name
-        lib = self._effective_schema()
-        if lib and "." not in table_name:
-            return f'"{lib}"."{table_name}"'
-        return table_name
+        lib, pure = self._split_schema_table(table_name, schema)
+        if lib:
+            return f'"{lib}"."{pure}"'
+        return f'"{pure}"'
 
     def get_connection(self):
         """Returns a DB-API 2.0 connection backed by the JTOpen JDBC driver."""
@@ -74,7 +92,7 @@ class Db2iConnector(SqlConnector):
         # The host alone identifies the IBM i system; there is no "/<database>" path
         # segment. The library is passed via the `libraries` property.
         props = ["prompt=false"]
-        lib = self._effective_schema()
+        lib = self._lib()
         if lib:
             props.append(f"libraries={lib}")
         if self.port:
@@ -163,21 +181,49 @@ class Db2iConnector(SqlConnector):
             logger.error(f"Error streaming batch from {table_name}: {exc}")
             return
 
-    def get_connection_tables(self):
+    def get_connection_schemas(self) -> List[str]:
+        """
+        List the IBM i libraries (schemas) available, excluding the system libraries
+        (the Q* / SYS* collections). The configured library is reordered to the front
+        by the API layer.
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
-        lib = self._effective_schema()
         try:
+            cursor.execute(
+                "SELECT SCHEMA_NAME FROM QSYS2.SYSSCHEMAS "
+                "WHERE SCHEMA_NAME NOT LIKE 'Q%' AND SCHEMA_NAME NOT LIKE 'SYS%' "
+                "ORDER BY SCHEMA_NAME"
+            )
+            return [row[0].strip() for row in cursor.fetchall() if row[0]]
+        except Exception as e:
+            logger.error(f"Error getting schemas: {e}")
+            # Fall back to the configured library so the UI still has one option.
+            lib = self._lib()
+            return [lib] if lib else []
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_connection_tables(self, schema: Optional[str] = None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        lib = self._lib(schema)
+        try:
+            # TABLE_TYPE: 'T' = SQL table, 'P' = (DDS) physical file. Most IBM i data
+            # lives in physical files, so both must be included or the list is empty.
             if lib:
                 cursor.execute(
                     "SELECT TABLE_NAME FROM QSYS2.SYSTABLES "
-                    "WHERE TABLE_TYPE = 'T' AND TABLE_SCHEMA = ?",
+                    "WHERE TABLE_TYPE IN ('T', 'P') AND TABLE_SCHEMA = ? "
+                    "ORDER BY TABLE_NAME",
                     [lib],
                 )
             else:
                 cursor.execute(
                     "SELECT TABLE_NAME FROM QSYS2.SYSTABLES "
-                    "WHERE TABLE_TYPE = 'T' AND TABLE_SCHEMA NOT LIKE 'Q%'"
+                    "WHERE TABLE_TYPE IN ('T', 'P') AND TABLE_SCHEMA NOT LIKE 'Q%' "
+                    "ORDER BY TABLE_NAME"
                 )
             tables = [row[0].strip() for row in cursor.fetchall()]
             return tables
@@ -188,16 +234,16 @@ class Db2iConnector(SqlConnector):
             cursor.close()
             conn.close()
 
-    def get_connection_columns(self, table_name):
+    def get_connection_columns(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
+            lib, pure_table = self._split_schema_table(table_name, schema)
             sql = (
                 "SELECT COLUMN_NAME, DATA_TYPE FROM QSYS2.SYSCOLUMNS "
                 "WHERE TABLE_NAME = ?"
             )
-            params = [table_name]
-            lib = self._effective_schema()
+            params = [pure_table]
             if lib:
                 sql += " AND TABLE_SCHEMA = ?"
                 params.append(lib)
@@ -206,7 +252,12 @@ class Db2iConnector(SqlConnector):
             cursor.execute(sql, params)
             rows = cursor.fetchall()
             columns = [
-                {"name": row[0].strip(), "type": cast_db2i_to_typescript_types(row[1])}
+                {
+                    "name": row[0].strip(),
+                    "type": normalize_ui_column_type(cast_db2i_to_typescript_types(row[1])),
+                    "alias": row[0].strip(),
+                    "classification": "",
+                }
                 for row in rows
             ]
             return columns
@@ -250,10 +301,10 @@ class Db2iConnector(SqlConnector):
             cur.close()
             conn.close()
 
-    def extract_table_schema(self, table_name):
+    def extract_table_schema(self, table_name, schema: Optional[str] = None):
         conn = self.get_connection()
         cursor = conn.cursor()
-        lib = self._effective_schema()
+        lib, pure_table = self._split_schema_table(table_name, schema)
         try:
             schema_filter = "AND c.TABLE_SCHEMA = ?" if lib else ""
             sql = f"""
@@ -289,8 +340,11 @@ class Db2iConnector(SqlConnector):
                     AND fk.TABLE_NAME = c.TABLE_NAME
                     AND fk.TABLE_SCHEMA = c.TABLE_SCHEMA
                 LEFT JOIN (
-                    SELECT DISTINCT COLUMN_NAME, TABLE_NAME, TABLE_SCHEMA
-                    FROM QSYS2.SYSKEYS
+                    SELECT DISTINCT k.COLUMN_NAME, i.TABLE_NAME, i.TABLE_SCHEMA
+                    FROM QSYS2.SYSKEYS k
+                    JOIN QSYS2.SYSINDEXES i
+                      ON k.INDEX_NAME = i.INDEX_NAME
+                     AND k.INDEX_SCHEMA = i.INDEX_SCHEMA
                 ) ix ON ix.COLUMN_NAME = c.COLUMN_NAME
                     AND ix.TABLE_NAME = c.TABLE_NAME
                     AND ix.TABLE_SCHEMA = c.TABLE_SCHEMA
@@ -298,7 +352,7 @@ class Db2iConnector(SqlConnector):
                 {schema_filter}
                 ORDER BY c.ORDINAL_POSITION
             """
-            params = [table_name]
+            params = [pure_table]
             if lib:
                 params.append(lib)
 
@@ -399,8 +453,8 @@ class Db2iConnector(SqlConnector):
             t = (t or "").strip().replace('"', "")
             if "." in t:
                 s, tb = t.split(".", 1)
-                return s.strip(), tb.strip()
-            return self._effective_schema(), t.strip()
+                return s.strip().upper(), tb.strip()
+            return self._lib(), t.strip()
 
         schema_name, pure_table = _split_schema_table(table_name)
 
