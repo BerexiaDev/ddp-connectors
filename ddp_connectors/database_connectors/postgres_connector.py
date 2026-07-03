@@ -523,6 +523,186 @@ class PostgresConnector(SqlConnector):
             cursor.close()
             conn.close()
 
+    @staticmethod
+    def _declared_column_type(column: Dict[str, Any]) -> str:
+        col_type = str(column.get("type") or column.get("data_type") or "").strip()
+        length = column.get("length")
+
+        if not col_type:
+            return "TEXT"
+
+        if col_type.upper() in ("VARCHAR", "CHAR") and length and "(" not in col_type:
+            return f"{col_type}({length})"
+
+        return col_type
+
+    @classmethod
+    def _reconciliation_column_type(cls, column: Dict[str, Any]) -> str:
+        raw_type = str(column.get("type") or column.get("data_type") or "").strip()
+        declared_type = cls._declared_column_type(column)
+        normalized_type = " ".join(
+            raw_type
+            .replace("_", " ")
+            .split()
+        ).lower()
+
+        if not normalized_type:
+            return "TEXT"
+
+        explicit_postgres_types = {
+            "text",
+            "varchar",
+            "char",
+            "character varying",
+            "character",
+            "boolean",
+            "bool",
+            "date",
+            "timestamp",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "timestamptz",
+            "jsonb",
+            "bytea",
+            "uuid",
+        }
+        generic_source_types = {
+            "string",
+            "integer",
+            "int",
+            "int2",
+            "int4",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "long",
+            "bigint",
+            "smallint",
+            "tinyint",
+            "float",
+            "double",
+            "decimal",
+            "decimal128",
+            "numeric",
+            "number",
+            "real",
+            "boolean",
+            "bool",
+            "date",
+            "datetime",
+            "timestamp",
+            "timestamptz",
+            "json",
+            "jsonb",
+            "object",
+            "dict",
+            "document",
+            "record",
+            "array",
+            "list",
+            "set",
+            "multiset",
+            "text",
+            "null",
+            "binary",
+            "uuid",
+            "objectid",
+        }
+        if "(" in declared_type and ")" in declared_type:
+            return declared_type.upper()
+        if normalized_type in explicit_postgres_types and (
+            raw_type == raw_type.upper()
+            or normalized_type not in generic_source_types
+        ):
+            if normalized_type == "bool":
+                return "BOOLEAN"
+            if normalized_type in {"timestamp with time zone", "timestamp without time zone", "timestamptz"}:
+                return "TIMESTAMP"
+            return declared_type.upper()
+
+        if normalized_type in {"json", "jsonb", "object", "dict", "document", "record", "array", "list", "set", "multiset"}:
+            return "JSONB"
+        if normalized_type in {"bool", "boolean"}:
+            return "BOOLEAN"
+        if normalized_type == "date":
+            return "DATE"
+        if normalized_type in {"datetime", "timestamp", "timestamp with time zone", "timestamp without time zone", "timestamptz"}:
+            return "TIMESTAMP"
+        if normalized_type in {"int", "integer", "int2", "int4", "int8", "int16", "int32", "int64", "long", "bigint", "smallint", "tinyint"}:
+            return "BIGINT"
+        if normalized_type in {"float", "double", "double precision", "decimal", "decimal128", "numeric", "number", "real"}:
+            return "DOUBLE PRECISION"
+        if normalized_type in {"string", "text", "objectid", "null"}:
+            return "TEXT"
+        if normalized_type == "binary":
+            return "BYTEA"
+        if normalized_type == "uuid":
+            return "UUID"
+
+        return "TEXT"
+
+    def ensure_columns_exist(self, schema: str, table_name: str, columns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        if not target_schema:
+            raise ValueError("A target schema is required to reconcile Postgres columns.")
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s;
+                """,
+                (target_schema, pure_table),
+            )
+            existing_columns = {row[0] for row in cursor.fetchall()}
+            missing_columns = []
+            seen_missing_columns = set()
+            for column in columns or []:
+                column_name = self._normalize_identifier(column.get("name"))
+                if (
+                    not column_name
+                    or column_name in existing_columns
+                    or column_name in seen_missing_columns
+                ):
+                    continue
+                missing_columns.append(column)
+                seen_missing_columns.add(column_name)
+
+            if not missing_columns:
+                return []
+
+            qualified_table = self._qualify_table_sql(pure_table, target_schema)
+            for column in missing_columns:
+                column_name = self._normalize_identifier(column["name"])
+                column_type = self._reconciliation_column_type(column)
+                ddl = (
+                    f"ALTER TABLE {qualified_table} "
+                    f"ADD COLUMN IF NOT EXISTS {self._quote_identifier(column_name)} {column_type};"
+                )
+                cursor.execute(ddl)
+
+            conn.commit()
+            logger.info(
+                f"Added {len(missing_columns)} missing columns to {target_schema}.{pure_table}: "
+                f"{[column['name'] for column in missing_columns]}"
+            )
+            return missing_columns
+        except Exception as e:
+            logger.error(f"Failed reconciling columns on {target_schema}.{pure_table}: {e}")
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+
+    def add_missing_columns(self, schema: str, table_name: str, columns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return self.ensure_columns_exist(schema, table_name, columns)
+
     def build_create_partitioned_table_statement(
         self,
         table_name: str,
@@ -665,18 +845,11 @@ class PostgresConnector(SqlConnector):
         index_keys = []
         for col in columns:
             col_name = col["name"]
-            col_type = col["type"]
-            length = col.get("length")
+            col_type_str = self._declared_column_type(col)
             nullable = col["nullable"].strip() == "YES"
             is_pk = col["primary_key"].strip() == "YES"
             if col['is_index'] == "YES":
                 index_keys.append(col_name)
-
-            # Only append length if it's a string type that doesn't already have it
-            if col_type.upper() in ("VARCHAR", "CHAR") and length and "(" not in col_type:
-                col_type_str = f"{col_type}({length})"
-            else:
-                col_type_str = col_type
 
             # Build column definition
             col_def_parts = [f'"{col_name}"', col_type_str]
