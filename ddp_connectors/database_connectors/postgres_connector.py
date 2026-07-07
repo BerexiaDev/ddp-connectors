@@ -21,6 +21,18 @@ class PostgresConnector(SqlConnector):
         super().__init__(host, user, password, port, database)
         self.driver = "postgresql+psycopg2"
         self.schema = schema
+
+    def _build_search_path(self) -> str:
+        search_path_parts: List[str] = []
+
+        normalized_schema = self._normalize_identifier(self.schema)
+        if normalized_schema:
+            search_path_parts.append(normalized_schema)
+
+        if not any(part.lower() == "public" for part in search_path_parts):
+            search_path_parts.append("public")
+
+        return ",".join(search_path_parts)
     
     def get_connection(self):
         conn_params = {
@@ -30,8 +42,11 @@ class PostgresConnector(SqlConnector):
             "port": self.port,
             "dbname": self.database,
             "connect_timeout": 10,
-            "options" : f"-c search_path={self.schema}"
         }
+
+        search_path = self._build_search_path()
+        if search_path:
+            conn_params["options"] = f"-c search_path={search_path}"
 
         return psycopg2.connect(**conn_params)
 
@@ -1453,6 +1468,7 @@ class PostgresConnector(SqlConnector):
                 SELECT
                     column_name,
                     data_type,
+                    udt_schema,
                     udt_name
                 FROM information_schema.columns
                 WHERE table_schema = %s
@@ -1464,11 +1480,12 @@ class PostgresConnector(SqlConnector):
 
             select_parts = []
 
-            for column_name, data_type, udt_name in cur.fetchall():
+            for column_name, data_type, udt_schema, udt_name in cur.fetchall():
                 quoted_col = self._quote_identifier(column_name)
                 if data_type == "USER-DEFINED" and udt_name in ("geometry", "geography"):
+                    function_schema = self._quote_identifier(udt_schema or "public")
                     select_parts.append(
-                        f"ST_AsText({quoted_col}) AS {quoted_col}"
+                        f"{function_schema}.ST_AsText({quoted_col}) AS {quoted_col}"
                     )
                 elif data_type in DATE_TIME_TYPES:
                     select_parts.append(f"{quoted_col}::text AS {quoted_col}")
