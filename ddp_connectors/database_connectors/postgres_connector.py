@@ -50,8 +50,12 @@ class PostgresConnector(SqlConnector):
 
         return psycopg2.connect(**conn_params)
 
-    def _quote_identifier(self, identifier: str) -> str:
-        normalized = self._normalize_identifier(identifier) or ""
+    def _quote_identifier(self, identifier: str, preserve_exact: bool = False) -> str:
+        normalized = (
+            str(identifier)
+            if preserve_exact and identifier is not None
+            else self._normalize_identifier(identifier) or ""
+        )
         return f'"{normalized.replace(chr(34), chr(34) * 2)}"'
 
     def _qualify_table_sql(self, table_name: str, schema: Optional[str] = None) -> str:
@@ -171,10 +175,10 @@ class PostgresConnector(SqlConnector):
                     for i, part in enumerate(json_parts):
                         col_expr += f"->>'{part}'" if i == len(json_parts) - 1 else f"->'{part}'"
                 else:
-                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", col_name):
-                        logger.warning(f"Skipping filter with invalid column name: {col_name}")
+                    if col_name == "":
+                        logger.warning("Skipping filter with empty column name.")
                         continue
-                    col_expr = f'"{col_name}"'
+                    col_expr = self._quote_identifier(col_name, preserve_exact=True)
 
                 raw_operator = condition.get("operator")
                 op_key = str(raw_operator).strip().upper().replace(" ", "_") if raw_operator else None
@@ -407,10 +411,11 @@ class PostgresConnector(SqlConnector):
         cur = conn.cursor()
         qualified_table = self._qualify_table_sql(table_name, schema)
         try:
+            quoted_column = self._quote_identifier(column_name, preserve_exact=True)
             sql = (
-                f"SELECT MIN({self._quote_identifier(column_name)}), MAX({self._quote_identifier(column_name)}) "
+                f"SELECT MIN({quoted_column}), MAX({quoted_column}) "
                 f"FROM {qualified_table} "
-                f"WHERE {self._quote_identifier(column_name)} IS NOT NULL;"
+                f"WHERE {quoted_column} IS NOT NULL;"
             )
             cur.execute(sql)
             row = cur.fetchone()
@@ -678,7 +683,11 @@ class PostgresConnector(SqlConnector):
             missing_columns = []
             seen_missing_columns = set()
             for column in columns or []:
-                column_name = self._normalize_identifier(column.get("name"))
+                column_name = (
+                    str(column.get("name"))
+                    if column.get("name") is not None
+                    else None
+                )
                 if (
                     not column_name
                     or column_name in existing_columns
@@ -693,11 +702,11 @@ class PostgresConnector(SqlConnector):
 
             qualified_table = self._qualify_table_sql(pure_table, target_schema)
             for column in missing_columns:
-                column_name = self._normalize_identifier(column["name"])
+                column_name = str(column["name"])
                 column_type = self._reconciliation_column_type(column)
                 ddl = (
                     f"ALTER TABLE {qualified_table} "
-                    f"ADD COLUMN IF NOT EXISTS {self._quote_identifier(column_name)} {column_type};"
+                    f"ADD COLUMN IF NOT EXISTS {self._quote_identifier(column_name, preserve_exact=True)} {column_type};"
                 )
                 cursor.execute(ddl)
 
@@ -1431,7 +1440,7 @@ class PostgresConnector(SqlConnector):
             select_parts = []
 
             for column_name, data_type, _udt_name in cur.fetchall():
-                quoted_col = self._quote_identifier(column_name)
+                quoted_col = self._quote_identifier(column_name, preserve_exact=True)
                 if data_type in risky_types:
                     select_parts.append(f"{quoted_col}::text AS {quoted_col}")
                 else:
@@ -1481,7 +1490,7 @@ class PostgresConnector(SqlConnector):
             select_parts = []
 
             for column_name, data_type, udt_schema, udt_name in cur.fetchall():
-                quoted_col = self._quote_identifier(column_name)
+                quoted_col = self._quote_identifier(column_name, preserve_exact=True)
                 if data_type == "USER-DEFINED" and udt_name in ("geometry", "geography"):
                     function_schema = self._quote_identifier(udt_schema or "public")
                     select_parts.append(
