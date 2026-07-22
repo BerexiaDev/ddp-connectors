@@ -95,6 +95,248 @@ class PostgresConnector(SqlConnector):
 
         logger.exception(" ".join(details))
 
+    def _format_debug_rows(self, rows: List[Tuple[Any, ...]], limit: int = 10) -> List[Tuple[Any, ...]]:
+        formatted_rows: List[Tuple[Any, ...]] = []
+        for row in rows[:limit]:
+            formatted_rows.append(tuple(safe_convert_to_string(value) for value in row))
+        return formatted_rows
+
+    def _log_debug_query(
+        self,
+        cur,
+        label: str,
+        query: str,
+        params: Tuple[Any, ...] = (),
+        sample_limit: int = 10,
+    ) -> None:
+        try:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            logger.info(
+                f"[postgres][discovery_debug] database={self.database} user={self.user} label={label} "
+                f"returned_count={len(rows)} sample={self._format_debug_rows(rows, sample_limit)}"
+            )
+        except Exception as debug_exc:
+            logger.warning(
+                f"[postgres][discovery_debug] database={self.database} user={self.user} label={label} "
+                f"failed: {debug_exc}"
+            )
+
+    def _log_schema_discovery_debug_snapshot(self, cur) -> None:
+        self._log_debug_query(
+            cur,
+            label="session_context",
+            query="""
+                SELECT
+                  current_database(),
+                  current_user,
+                  session_user,
+                  current_role,
+                  current_schema(),
+                  current_setting('search_path'),
+                  inet_server_addr()::text,
+                  inet_server_port()::text;
+            """,
+            sample_limit=1,
+        )
+        self._log_debug_query(
+            cur,
+            label="information_schema.schemata",
+            query="""
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT LIKE 'pg_%'
+                  AND schema_name <> 'information_schema'
+                ORDER BY schema_name;
+            """,
+            sample_limit=25,
+        )
+        self._log_debug_query(
+            cur,
+            label="information_schema.tables_by_schema",
+            query="""
+                SELECT table_schema, table_type, COUNT(*)
+                FROM information_schema.tables
+                GROUP BY table_schema, table_type
+                ORDER BY table_schema, table_type;
+            """,
+            sample_limit=50,
+        )
+
+    def _log_table_discovery_debug_snapshot(self, cur, target_schema: Optional[str]) -> None:
+        self._log_debug_query(
+            cur,
+            label="session_context",
+            query="""
+                SELECT
+                  current_database(),
+                  current_user,
+                  session_user,
+                  current_role,
+                  current_schema(),
+                  current_setting('search_path'),
+                  inet_server_addr()::text,
+                  inet_server_port()::text;
+            """,
+            sample_limit=1,
+        )
+        self._log_debug_query(
+            cur,
+            label="role_attributes",
+            query="""
+                SELECT rolname, rolcanlogin, rolinherit, rolcreaterole, rolcreatedb, rolsuper
+                FROM pg_roles
+                WHERE rolname = current_user;
+            """,
+            sample_limit=5,
+        )
+        self._log_debug_query(
+            cur,
+            label="role_memberships",
+            query="""
+                SELECT parent.rolname
+                FROM pg_auth_members AS m
+                JOIN pg_roles AS parent ON parent.oid = m.roleid
+                JOIN pg_roles AS child ON child.oid = m.member
+                WHERE child.rolname = current_user
+                ORDER BY parent.rolname;
+            """,
+            sample_limit=25,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"schema_privileges:{target_schema}",
+            query="""
+                SELECT
+                  has_schema_privilege(current_user, %s, 'USAGE'),
+                  has_schema_privilege(current_user, %s, 'CREATE');
+            """,
+            params=(target_schema, target_schema),
+            sample_limit=1,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"information_schema.tables_all_types:{target_schema}",
+            query="""
+                SELECT table_name, table_type
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                ORDER BY table_name;
+            """,
+            params=(target_schema,),
+            sample_limit=50,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"information_schema.tables_by_type:{target_schema}",
+            query="""
+                SELECT table_type, COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                GROUP BY table_type
+                ORDER BY table_type;
+            """,
+            params=(target_schema,),
+            sample_limit=10,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"pg_tables:{target_schema}",
+            query="""
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = %s
+                ORDER BY tablename;
+            """,
+            params=(target_schema,),
+            sample_limit=50,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"pg_class_relkinds:{target_schema}",
+            query="""
+                SELECT c.relkind, COUNT(*)
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                GROUP BY c.relkind
+                ORDER BY c.relkind;
+            """,
+            params=(target_schema,),
+            sample_limit=25,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"pg_class_objects:{target_schema}",
+            query="""
+                SELECT c.relname, c.relkind, pg_get_userbyid(c.relowner)
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                ORDER BY c.relkind, c.relname;
+            """,
+            params=(target_schema,),
+            sample_limit=50,
+        )
+        self._log_debug_query(
+            cur,
+            label="information_schema.tables_by_schema",
+            query="""
+                SELECT table_schema, table_type, COUNT(*)
+                FROM information_schema.tables
+                GROUP BY table_schema, table_type
+                ORDER BY table_schema, table_type;
+            """,
+            sample_limit=50,
+        )
+
+    def _log_column_discovery_debug_snapshot(self, cur, target_schema: Optional[str], pure_table: str) -> None:
+        self._log_debug_query(
+            cur,
+            label="session_context",
+            query="""
+                SELECT
+                  current_database(),
+                  current_user,
+                  session_user,
+                  current_role,
+                  current_schema(),
+                  current_setting('search_path');
+            """,
+            sample_limit=1,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"information_schema.columns:{target_schema}.{pure_table}",
+            query="""
+                SELECT column_name, data_type, udt_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                ORDER BY ordinal_position;
+            """,
+            params=(target_schema, pure_table),
+            sample_limit=50,
+        )
+        self._log_debug_query(
+            cur,
+            label=f"pg_attribute_columns:{target_schema}.{pure_table}",
+            query="""
+                SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+                FROM pg_attribute AS a
+                JOIN pg_class AS c ON c.oid = a.attrelid
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname = %s
+                  AND c.relname = %s
+                  AND a.attnum > 0
+                  AND NOT a.attisdropped
+                ORDER BY a.attnum;
+            """,
+            params=(target_schema, pure_table),
+            sample_limit=50,
+        )
+
     def get_connection_schemas(self) -> List[str]:
         conn = None
         cur = None
@@ -113,7 +355,13 @@ class PostgresConnector(SqlConnector):
                  ORDER BY nspname;
                  """
             )
-            return [row[0] for row in cur.fetchall()]
+            schemas = [row[0] for row in cur.fetchall()]
+            logger.info(
+                f"[postgres][schema_discovery] database={self.database} returned_count={len(schemas)} sample={schemas[:25]}"
+            )
+            if not schemas:
+                self._log_schema_discovery_debug_snapshot(cur)
+            return schemas
         except Exception as exc:
             self._log_metadata_failure(
                 operation="schema_discovery",
@@ -373,7 +621,14 @@ class PostgresConnector(SqlConnector):
                 """,
                 (target_schema,),
             )
-            return [row[0] for row in cur.fetchall()]
+            tables = [row[0] for row in cur.fetchall()]
+            logger.info(
+                f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} "
+                f"returned_count={len(tables)} sample={tables[:25]}"
+            )
+            if not tables:
+                self._log_table_discovery_debug_snapshot(cur, target_schema)
+            return tables
         except Exception as exc:
             self._log_metadata_failure(
                 operation="table_discovery",
@@ -412,6 +667,12 @@ class PostgresConnector(SqlConnector):
                 (target_schema, pure_table),
             )
             rows = cur.fetchall()
+            logger.info(
+                f"[postgres][column_discovery] database={self.database} selected_schema={target_schema} "
+                f"selected_table={pure_table} returned_count={len(rows)} sample={[row[0] for row in rows[:25]]}"
+            )
+            if not rows:
+                self._log_column_discovery_debug_snapshot(cur, target_schema, pure_table)
 
             columns: List[Dict[str, str]] = []
             for column_name, data_type, udt_name in rows:
