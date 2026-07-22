@@ -64,10 +64,43 @@ class PostgresConnector(SqlConnector):
             return f"{self._quote_identifier(resolved_schema)}.{self._quote_identifier(resolved_table)}"
         return self._quote_identifier(resolved_table)
 
+    def _log_metadata_failure(
+        self,
+        operation: str,
+        query_path: str,
+        exc: Exception,
+        schema: Optional[str] = None,
+        table: Optional[str] = None,
+    ) -> None:
+        details = [
+            f"[postgres][{operation}]",
+            f"database={self.database}",
+            f"user={self.user}",
+            f"query_path={query_path}",
+        ]
+
+        if schema:
+            details.append(f"selected_schema={schema}")
+        if table:
+            details.append(f"selected_table={table}")
+
+        pgcode = getattr(exc, "pgcode", None)
+        if pgcode:
+            details.append(f"pgcode={pgcode}")
+
+        diag = getattr(exc, "diag", None)
+        primary_message = getattr(diag, "message_primary", None) if diag else None
+        if primary_message:
+            details.append(f"pg_message={primary_message}")
+
+        logger.exception(" ".join(details))
+
     def get_connection_schemas(self) -> List[str]:
-        conn = self.get_connection()
-        cur = conn.cursor()
+        conn = None
+        cur = None
         try:
+            conn = self.get_connection()
+            cur = conn.cursor()
             logger.info(
                 f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace exclude_system=true"
             )
@@ -77,18 +110,22 @@ class PostgresConnector(SqlConnector):
                 FROM pg_namespace
                 WHERE nspname NOT LIKE 'pg_%'
                   AND nspname <> 'information_schema'
-                ORDER BY nspname;
-                """
+                 ORDER BY nspname;
+                 """
             )
             return [row[0] for row in cur.fetchall()]
-        except Exception as e:
-            logger.error(
-                f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace failed: {e}"
+        except Exception as exc:
+            self._log_metadata_failure(
+                operation="schema_discovery",
+                query_path="pg_namespace",
+                exc=exc,
             )
-            return []
+            raise
         finally:
-            cur.close()
-            conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
 
     def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
         """Parse filters payload into a safe WHERE clause and parameters."""
@@ -318,10 +355,12 @@ class PostgresConnector(SqlConnector):
                 conn.close()
 
     def get_connection_tables(self, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cur = conn.cursor()
         target_schema = self._normalize_identifier(schema) or self.schema
+        conn = None
+        cur = None
         try:
+            conn = self.get_connection()
+            cur = conn.cursor()
             logger.info(
                 f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables"
             )
@@ -335,20 +374,30 @@ class PostgresConnector(SqlConnector):
                 (target_schema,),
             )
             return [row[0] for row in cur.fetchall()]
-        except Exception as e:
-            logger.error(
-                f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables failed: {e}"
+        except Exception as exc:
+            self._log_metadata_failure(
+                operation="table_discovery",
+                query_path="information_schema.tables",
+                exc=exc,
+                schema=target_schema,
             )
-            return []
+            raise
         finally:
-            cur.close()
-            conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
 
     def get_connection_columns(self, table_name: str, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cur = conn.cursor()
         target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        conn = None
+        cur = None
         try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            logger.info(
+                f"[postgres][column_discovery] database={self.database} selected_schema={target_schema} selected_table={pure_table} query_path=information_schema.columns"
+            )
             cur.execute(
                 """
                 SELECT
@@ -375,12 +424,20 @@ class PostgresConnector(SqlConnector):
                     "classification": "",
                 })
             return columns
-        except Exception as e:
-            logger.error(f"Error getting columns: {e}")
-            return []
+        except Exception as exc:
+            self._log_metadata_failure(
+                operation="column_discovery",
+                query_path="information_schema.columns",
+                exc=exc,
+                schema=target_schema,
+                table=pure_table,
+            )
+            raise
         finally:
-            cur.close()
-            conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
 
 
     def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
