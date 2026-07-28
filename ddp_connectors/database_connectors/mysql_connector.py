@@ -22,6 +22,7 @@ class MySQLConnector(SqlConnector):
     def __init__(self, host, user, password, port, database):
         super().__init__(host, user, password, port, database)
         self.driver = "mysql+mysqlconnector"
+        self._column_metadata_cache: Dict[Tuple[Optional[str], str], List[Dict[str, Any]]] = {}
 
     def get_connection(self):
         conn_params = {
@@ -47,6 +48,123 @@ class MySQLConnector(SqlConnector):
         if resolved_schema:
             return f"{self._quote_identifier(resolved_schema)}.{self._quote_identifier(resolved_table)}"
         return self._quote_identifier(resolved_table)
+
+    @staticmethod
+    def _is_boolean_like_mysql_type(
+        data_type: Optional[str],
+        column_type: Optional[str] = None,
+        numeric_precision: Optional[int] = None,
+    ) -> bool:
+        normalized_data_type = (data_type or "").lower().strip()
+        normalized_column_type = (column_type or "").lower().strip()
+
+        if normalized_data_type in {"bool", "boolean"}:
+            return True
+        if normalized_data_type == "bit":
+            return numeric_precision == 1 or normalized_column_type == "bit(1)"
+        if normalized_data_type == "tinyint":
+            return normalized_column_type.startswith("tinyint(1)")
+        return False
+
+    @classmethod
+    def _mysql_column_to_postgres_type(
+        cls,
+        data_type: Optional[str],
+        column_type: Optional[str] = None,
+        numeric_precision: Optional[int] = None,
+    ) -> str:
+        if cls._is_boolean_like_mysql_type(data_type, column_type, numeric_precision):
+            return "SMALLINT"
+        return cast_mysql_to_postgresql_type(data_type or "")
+
+    @classmethod
+    def _mysql_column_to_ui_type(
+        cls,
+        data_type: Optional[str],
+        column_type: Optional[str] = None,
+        numeric_precision: Optional[int] = None,
+    ) -> str:
+        if cls._is_boolean_like_mysql_type(data_type, column_type, numeric_precision):
+            return "number"
+        return normalize_ui_column_type(cast_mysql_to_typescript_types(data_type or ""))
+
+    @staticmethod
+    def _normalize_mysql_boolean_value(value):
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+            if not raw:
+                return None
+            return int.from_bytes(raw, byteorder="big", signed=False)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "t", "yes", "y"}:
+                return 1
+            if normalized in {"0", "false", "f", "no", "n"}:
+                return 0
+            return value
+        if isinstance(value, (int, float)):
+            return int(value)
+        return value
+
+    def _get_table_column_metadata(self, table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
+        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+        cache_key = (target_schema, pure_table)
+        cached = self._column_metadata_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT
+                    column_name,
+                    data_type,
+                    column_type,
+                    numeric_precision
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                ORDER BY ordinal_position;
+                """,
+                (target_schema, pure_table),
+            )
+            metadata = [
+                {
+                    "name": row[0],
+                    "data_type": row[1],
+                    "column_type": row[2],
+                    "numeric_precision": row[3],
+                    "is_boolean": self._is_boolean_like_mysql_type(row[1], row[2], row[3]),
+                }
+                for row in cursor.fetchall()
+            ]
+            self._column_metadata_cache[cache_key] = metadata
+            return metadata
+        finally:
+            cursor.close()
+            conn.close()
+
+    def _normalize_sync_row(
+        self,
+        row: Tuple[Any, ...],
+        column_metadata: List[Dict[str, Any]],
+    ) -> Tuple[Any, ...]:
+        if not row or not column_metadata:
+            return row
+
+        normalized_row = list(row)
+        for idx, column in enumerate(column_metadata[: len(normalized_row)]):
+            if column.get("is_boolean"):
+                normalized_row[idx] = self._normalize_mysql_boolean_value(normalized_row[idx])
+        return tuple(normalized_row)
 
     def get_connection_schemas(self) -> List[str]:
         logger.info(
@@ -186,9 +304,10 @@ class MySQLConnector(SqlConnector):
         try:
             limit = kwargs.get("limit", batch_size)
             qualified_table = self._qualify_table_sql(table_name, schema)
+            column_metadata = self._get_table_column_metadata(table_name, schema)
             query = f"SELECT * FROM {qualified_table} LIMIT {limit} OFFSET {offset}"
             cursor.execute(query)
-            return cursor.fetchall()
+            return [self._normalize_sync_row(row, column_metadata) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error fetching batch from {table_name}: {str(e)}")
             return []
@@ -208,6 +327,7 @@ class MySQLConnector(SqlConnector):
             raise ValueError("table_name is required")
 
         qualified_table = self._qualify_table_sql(table_name, schema)
+        column_metadata = self._get_table_column_metadata(table_name, schema)
         try:
             if cursor is None:
                 conn = self.get_connection()
@@ -222,7 +342,7 @@ class MySQLConnector(SqlConnector):
                 rows = managed_cursor.fetchmany(batch_size)
                 if not rows:
                     break
-                yield rows
+                yield [self._normalize_sync_row(row, column_metadata) for row in rows]
 
             logger.info(f"Finished streaming MySQL table {qualified_table}")
 
@@ -270,7 +390,7 @@ class MySQLConnector(SqlConnector):
         try:
             cursor.execute(
                 """
-                SELECT column_name, data_type
+                SELECT column_name, data_type, column_type, numeric_precision
                 FROM information_schema.columns
                 WHERE table_schema = %s
                   AND table_name = %s
@@ -281,8 +401,12 @@ class MySQLConnector(SqlConnector):
             rows = cursor.fetchall()
 
             columns: List[Dict[str, str]] = []
-            for column_name, data_type in rows:
-                ts_type = normalize_ui_column_type(cast_mysql_to_typescript_types(data_type))
+            for column_name, data_type, column_type, numeric_precision in rows:
+                ts_type = self._mysql_column_to_ui_type(
+                    data_type,
+                    column_type,
+                    numeric_precision,
+                )
                 columns.append({
                     "name": column_name,
                     "type": ts_type,
@@ -341,6 +465,8 @@ class MySQLConnector(SqlConnector):
                     c.ORDINAL_POSITION AS position,
                     c.COLUMN_NAME AS name,
                     c.DATA_TYPE AS data_type,
+                    c.COLUMN_TYPE AS column_type,
+                    c.NUMERIC_PRECISION AS numeric_precision,
                     c.CHARACTER_MAXIMUM_LENGTH AS max_length,
                     CASE WHEN c.IS_NULLABLE = 'YES' THEN 'YES' ELSE 'NO' END AS is_nullable,
                     c.COLUMN_DEFAULT AS default_value,
@@ -363,13 +489,13 @@ class MySQLConnector(SqlConnector):
                     AND s.TABLE_NAME = c.TABLE_NAME
                     AND s.COLUMN_NAME = c.COLUMN_NAME
                     AND s.INDEX_NAME != 'PRIMARY'
-                WHERE c.TABLE_SCHEMA = %s
-                  AND c.TABLE_NAME = %s
-                GROUP BY c.ORDINAL_POSITION, c.COLUMN_NAME, c.DATA_TYPE,
-                         c.CHARACTER_MAXIMUM_LENGTH, c.IS_NULLABLE, c.COLUMN_DEFAULT,
+                 WHERE c.TABLE_SCHEMA = %s
+                   AND c.TABLE_NAME = %s
+                 GROUP BY c.ORDINAL_POSITION, c.COLUMN_NAME, c.DATA_TYPE,
+                         c.COLUMN_TYPE, c.NUMERIC_PRECISION, c.CHARACTER_MAXIMUM_LENGTH, c.IS_NULLABLE, c.COLUMN_DEFAULT,
                          k.CONSTRAINT_NAME, fk.CONSTRAINT_NAME, s.INDEX_NAME
-                ORDER BY c.ORDINAL_POSITION;
-            """
+                 ORDER BY c.ORDINAL_POSITION;
+             """
 
             cursor.execute(schema_sql, (target_schema, pure_table))
             rows = cursor.fetchall()
@@ -385,13 +511,13 @@ class MySQLConnector(SqlConnector):
                 result.append({
                     "position": row[0],
                     "name": col_name,
-                    "type": cast_mysql_to_postgresql_type(row[2]),
-                    "length": row[3],
-                    "nullable": row[4],
-                    "default": row[5],
-                    "primary_key": row[6],
-                    "foreign_key": row[7],
-                    "is_index": row[8],
+                    "type": self._mysql_column_to_postgres_type(row[2], row[3], row[4]),
+                    "length": row[5],
+                    "nullable": row[6],
+                    "default": row[7],
+                    "primary_key": row[8],
+                    "foreign_key": row[9],
+                    "is_index": row[10],
                 })
 
             return result
@@ -406,6 +532,7 @@ class MySQLConnector(SqlConnector):
     def fetch_deltas(self, cursor, primary_keys, log_table: str, since_ts: datetime, batch_size: int = 10_000, schema: Optional[str] = None):
         primary_keys = self.normalize_primary_keys(primary_keys)
         qualified_log_table = self._qualify_table_sql(log_table, schema)
+        column_metadata = self._get_table_column_metadata(log_table, schema)
         if not primary_keys:
             logger.error("fetch_deltas requires at least one primary key column.")
             return
@@ -439,7 +566,8 @@ class MySQLConnector(SqlConnector):
 
             col_names = [desc[0] for desc in cursor.description]
             for row in rows:
-                yield dict(zip(col_names, row))
+                normalized_row = self._normalize_sync_row(row, column_metadata)
+                yield dict(zip(col_names, normalized_row))
 
             offset += batch_size
 
