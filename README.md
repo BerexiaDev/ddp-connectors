@@ -74,6 +74,43 @@ Each connector handles the dialect differences internally — pagination syntax,
 
 ---
 
+## Read-only SFTP file sources
+
+`sftp` is a file-oriented connector, not a database connector. It supports verified-host-key authentication, file/directory listing, metadata retrieval, and incremental binary reads only. It has no SQL/table API and cannot upload, delete, rename, or modify remote files.
+
+Use either a `known_hosts` file or a pinned `SHA256:` host-key fingerprint; omitting both is rejected. Password authentication is supported, as is a private key supplied through `private_key_path` (with optional `private_key_passphrase`). SSH agent, keyboard-interactive, bastion, proxy, and remote-shell support are intentionally not provided.
+
+```python
+from ddp_connectors.connectors_factory import ConnectorFactory
+
+connector = ConnectorFactory().create_connector("sftp", {
+    "host": "sftp.example.org",
+    "port": 22,
+    "user": "acaps-reader",
+    "password": "obtained-from-a-secret-store",
+    "remote_root": "/exports/acaps",
+    "known_hosts": "/run/secrets/sftp_known_hosts",
+    "connect_timeout": 10,
+    "auth_timeout": 10,
+    "socket_timeout": 30,
+})
+try:
+    for item in connector.list_files(recursive=True):
+        if item.is_file:
+            with connector.open_file(item.path) as source:
+                while chunk := source.read(1024 * 1024):
+                    # DeepKube owns the destination object-store upload.
+                    consume(chunk)
+finally:
+    connector.close()
+```
+
+The connector is synchronous and must not be shared between threads. Streams are caller-owned; closing the connector invalidates any remaining open streams. Paths are constrained to `remote_root`; symlinks are returned by listing but never traversed or opened.
+
+Configuration: `host`, `user`, and absolute `remote_root` are required; `port` defaults to 22. Configure exactly one authentication field (`password` or `private_key_path`) and exactly one host-trust field (`known_hosts` or `host_key_fingerprint`). Optional timeouts are `connect_timeout`, `auth_timeout`, and `socket_timeout`.
+
+---
+
 ## Core Capabilities
 
 ### Data Extraction
