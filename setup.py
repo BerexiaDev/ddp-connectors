@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ddp_connectors',
-    version='0.0.8',
+    version='0.0.9',
     packages=find_packages(),
     # Add dependencies here
     install_requires=[
@@ -14,6 +14,7 @@ setup(
         "loguru",
         "jaydebeapi",  # Db2 for IBM i (JDBC via JTOpen jt400.jar)
         "JPype1",      # JVM bridge used by jaydebeapi
+        "paramiko>=3.4,<5",  # secure SSH/SFTP transport for read-only file sources
     ],
     description='Deepkube Data Platform Global Library',
     author='Berexia DEV Team',
