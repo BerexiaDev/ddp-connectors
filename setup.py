@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ddp_connectors',
-    version='0.0.9',
+    version='0.1.1',
     packages=find_packages(),
     # Add dependencies here
     install_requires=[
