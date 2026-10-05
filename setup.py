@@ -1,30 +1,4 @@
-from setuptools import setup, find_packages
+"""Compatibility entry point; package metadata lives in pyproject.toml."""
+from setuptools import setup
 
-setup(
-    name='ddp_connectors',
-    version='0.1.1',
-    packages=find_packages(),
-    # Add dependencies here
-    install_requires=[
-        "pyodbc",
-        "psycopg2",
-        "sqlalchemy",
-        "cx_oracle",
-        "mysql-connector-python",
-        "loguru",
-        "jaydebeapi",  # Db2 for IBM i (JDBC via JTOpen jt400.jar)
-        "JPype1",      # JVM bridge used by jaydebeapi
-        "paramiko>=3.4,<5",  # secure SSH/SFTP transport for read-only file sources
-    ],
-    description='Deepkube Data Platform Global Library',
-    author='Berexia DEV Team',
-    author_email='berexiadev@berexia.com',
-    long_description=open('README.md').read(),
-    long_description_content_type='text/markdown',
-    classifiers=[
-        'Programming Language :: Python :: 3',
-        'License :: OSI Approved :: MIT License',
-        'Operating System :: OS Independent',
-    ],
-    python_requires='>=3.6',
-)
+setup()
