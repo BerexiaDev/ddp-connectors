@@ -242,7 +242,7 @@ need extras.
 | `pymongo` | MongoDB | A MongoDB server. Never install the separate `bson` package |
 | `JayDeBeApi`, `JPype1` | Db2 for IBM i | Java (JVM) and `jt400.jar`. Set `JT400_JAR` |
 | `paramiko` | SFTP | An SFTP server and trusted host keys |
-| `pandas` | PostgreSQL type detection | pandas 2.2 or newer (below 3) |
+| `pandas` | PostgreSQL type detection | pandas 1.5 or newer (below 2) |
 | `SQLAlchemy`, `loguru` | SQL types, logging | Nothing |
 | `ddp-lib` | Oracle serialization | Nothing (no Flask setup needed) |
 
@@ -260,8 +260,9 @@ Notes:
 ## Upgrading an application
 
 - Replace old Git links such as `ddp-connectors@0.0.4` with the `0.2.0` tag.
-- Update pandas 1.5 and NumPy 1.23 together for pandas 2.2 or newer, and update
-  Flask-RESTX 1.2 to 1.3.x for ddp-lib 0.2.
+- Keep pandas 1.5. The connector accepts `pandas>=1.5,<2`, which matches the
+  API pin `pandas==1.5.3` and `pandas-profiling==3.5.0`.
+- Update Flask-RESTX 1.2 to 1.3.x for ddp-lib 0.2.
 - Keep Core's PyMongo 3 setup. Both shared packages require `pymongo>=3.10.1,<4`;
   the existing `pymongo==3.10.1` pin remains allowed.
 - The smoke tests do not prove that an existing application lock file works.
