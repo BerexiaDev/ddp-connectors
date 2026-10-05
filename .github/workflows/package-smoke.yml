@@ -1,0 +1,29 @@
+name: Package smoke tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ddp-connectors
+      # Use only the canonical dependency. Private repositories need a read-only
+      # cross-repository token in DDP_LIB_READ_TOKEN. Merge ddp-lib 0.2.0 first.
+      - uses: actions/checkout@v4
+        with:
+          repository: BerexiaDev/ddp-lib
+          ref: main
+          path: ddp-lib
+          token: ${{ secrets.DDP_LIB_READ_TOKEN || github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get update && sudo apt-get install -y libodbc2
+      - run: python -m pip install build twine
+      - run: python ddp-connectors/scripts/smoke_install.py
