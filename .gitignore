@@ -5,3 +5,4 @@ venv
 build
 dist
 ddp_connectors.egg-info
+docs/superpowers/plans
