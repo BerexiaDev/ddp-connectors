@@ -4,8 +4,10 @@ from datetime import datetime
 from loguru import logger
 from typing import Dict, Any, List, Optional
 from .sql_connector import SqlConnector
-from .sql_connector_utils import cast_oracle_to_postgresql_type, cast_oracle_to_typescript, normalize_ui_column_type, safe_convert_to_string
-from ddp_lib.utils import serialize_if_needed
+from .sql_connector_utils import (
+    cast_oracle_to_postgresql_type, cast_oracle_to_typescript,
+    normalize_ui_column_type, safe_convert_to_string, serialize_if_needed,
+)
 
 
 class OracleConnector(SqlConnector):

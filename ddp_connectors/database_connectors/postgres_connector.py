@@ -1053,6 +1053,8 @@ class PostgresConnector(SqlConnector):
         partition_column: str,
         partition_key: str,                 # NEW
         partition_method: str = "RANGE",
+        *,
+        include_defaults: bool = False,
     ):
         """
         Build CREATE TABLE for a partitioned parent table, with a composite PK:
@@ -1064,20 +1066,33 @@ class PostgresConnector(SqlConnector):
         if method not in ("RANGE", "LIST", "HASH"):
             raise ValueError(f"Unsupported partition method: {method}")
 
-        create_stmt, index_stmt = self.build_create_table_statement(table_name, schema_name, columns)
+        # The explicit partition key owns this constraint. Keep ordinary-table
+        # metadata PKs intact and never modify the caller's column dictionaries.
+        partition_columns = [{**col, "primary_key": "NO"} for col in columns]
+        # Existing subclasses may implement the original three-argument builder.
+        default_options = {"include_defaults": True} if include_defaults else {}
+        create_stmt, index_stmt = self.build_create_table_statement(
+            table_name, schema_name, partition_columns, **default_options
+        )
 
         # Inject composite PRIMARY KEY before closing ');'
-        pk_sql = f'PRIMARY KEY ("{partition_key}", "{partition_column}")'
+        keys = dict.fromkeys((partition_key, partition_column))
+        pk_sql = "PRIMARY KEY (" + ", ".join(
+            self._quote_identifier(key, preserve_exact=True) for key in keys
+        ) + ")"
         create_stmt = re.sub(
             r"\n\);\s*$",
-            f"\n,  {pk_sql}\n);",
+            lambda match: f"\n,  {pk_sql}\n);",
             create_stmt,
         )
 
         # Transform the ending ");" into ") PARTITION BY ...;"
         create_stmt = re.sub(
             r"\n\);\s*$",
-            f'\n) PARTITION BY {method} ("{partition_column}");',
+            lambda match: (
+                f'\n) PARTITION BY {method} '
+                f'({self._quote_identifier(partition_column, preserve_exact=True)});'
+            ),
             create_stmt,
         )
 
@@ -1093,8 +1108,10 @@ class PostgresConnector(SqlConnector):
 
         default_table = f"{parent_table}__p_default".lower()
         sql_txt = (
-            f'CREATE TABLE IF NOT EXISTS "{schema_name}"."{default_table}" '
-            f'PARTITION OF "{schema_name}"."{parent_table}" DEFAULT;'
+            f'CREATE TABLE IF NOT EXISTS {self._quote_identifier(schema_name, preserve_exact=True)}.'
+            f'{self._quote_identifier(default_table, preserve_exact=True)} '
+            f'PARTITION OF {self._quote_identifier(schema_name, preserve_exact=True)}.'
+            f'{self._quote_identifier(parent_table, preserve_exact=True)} DEFAULT;'
         )
 
         conn = self.get_connection()
@@ -1153,8 +1170,10 @@ class PostgresConnector(SqlConnector):
                 part_table = self._partition_table_name(parent_table, partition_column, str(label))
 
                 create_part_sql = (
-                    f'CREATE TABLE IF NOT EXISTS "{schema_name}"."{part_table}" '
-                    f'PARTITION OF "{schema_name}"."{parent_table}" '
+                    f'CREATE TABLE IF NOT EXISTS {self._quote_identifier(schema_name, preserve_exact=True)}.'
+                    f'{self._quote_identifier(part_table, preserve_exact=True)} '
+                    f'PARTITION OF {self._quote_identifier(schema_name, preserve_exact=True)}.'
+                    f'{self._quote_identifier(parent_table, preserve_exact=True)} '
                     f"FOR VALUES FROM ('{start.isoformat()}') TO ('{end.isoformat()}');"
                 )
                 cur.execute(create_part_sql)
@@ -1174,10 +1193,35 @@ class PostgresConnector(SqlConnector):
 
 
     
-    def build_create_table_statement(self, table_name: str, schema_name: str = 'public', columns=None):
+    @staticmethod
+    def _literal_default(value) -> Optional[str]:
+        """Return a portable SQL literal, never a source function/expression.
+
+        Plain quoted strings use doubled quotes. Backslash escapes, custom
+        casts and executable expressions deliberately remain source-owned.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        value = str(value).strip()
+        literal = r"(?:NULL|TRUE|FALSE|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|'(?:[^'\\\x00]|'')*')"
+        cast = (
+            r"(?:\s*::\s*(?:text|boolean|bool|smallint|integer|bigint|int[248]?|"
+            r"real|double precision|numeric|decimal|varchar|character varying|char|"
+            r"character|date|time|timestamp(?: with(?:out)? time zone)?|uuid|jsonb?|bytea)"
+            r"(?:\[\])*)?"
+        )
+        return value if re.fullmatch(literal + cast, value, re.IGNORECASE | re.ASCII) else None
+
+    def build_create_table_statement(
+        self, table_name: str, schema_name: str = 'public', columns=None, *, include_defaults: bool = False
+    ):
         """
         Generates a PostgreSQL CREATE TABLE statement along with a CREATE INDEX statement
         (for indexed columns) using the provided column metadata.
+        Defaults remain omitted unless include_defaults=True; only portable
+        literals (optionally cast to built-in PostgreSQL types) are copied.
         """
         if columns is None:
             columns = []
@@ -1194,15 +1238,20 @@ class PostgresConnector(SqlConnector):
                 index_keys.append(col_name)
 
             # Build column definition
-            col_def_parts = [f'"{col_name}"', col_type_str]
+            col_def_parts = [self._quote_identifier(col_name, preserve_exact=True), col_type_str]
 
             if not nullable:
                 col_def_parts.append("NOT NULL")
 
+            if include_defaults:
+                default = self._literal_default(col.get("default"))
+                if default is not None:
+                    col_def_parts.append(f"DEFAULT {default}")
+
             column_defs.append(" ".join(col_def_parts))
 
             if is_pk:
-                primary_keys.append(f'"{col_name}"')
+                primary_keys.append(self._quote_identifier(col_name, preserve_exact=True))
 
         # Append primary key constraint
         if primary_keys:
@@ -1210,13 +1259,18 @@ class PostgresConnector(SqlConnector):
             column_defs.append(pk_def)
 
         columns_sql = ",\n  ".join(column_defs)
-        create_stmt = f'CREATE TABLE IF NOT EXISTS "{schema_name}"."{table_name}" (\n  {columns_sql}\n);'
+        qualified_table = (
+            f'{self._quote_identifier(schema_name, preserve_exact=True)}.'
+            f'{self._quote_identifier(table_name, preserve_exact=True)}'
+        )
+        create_stmt = f'CREATE TABLE IF NOT EXISTS {qualified_table} (\n  {columns_sql}\n);'
         index_stmt = None
         if index_keys:
             index_statements = [
                 (
-                    f'CREATE INDEX IF NOT EXISTS "idx_{schema_name}_{table_name}_{col}" '
-                    f'ON "{schema_name}"."{table_name}" ("{col}")'
+                    f'CREATE INDEX IF NOT EXISTS '
+                    f'{self._quote_identifier(f"idx_{schema_name}_{table_name}_{col}", preserve_exact=True)} '
+                    f'ON {qualified_table} ({self._quote_identifier(col, preserve_exact=True)})'
                 )
                 for col in index_keys
             ]

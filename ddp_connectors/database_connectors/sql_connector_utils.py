@@ -1,7 +1,15 @@
+import json
 import re
 from typing import Dict
 
 import sqlalchemy
+
+
+def serialize_if_needed(value):
+    """JSON-encode dict/list values while preserving other Oracle bind values."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return value
 
 
 def safe_convert_to_string(value):
