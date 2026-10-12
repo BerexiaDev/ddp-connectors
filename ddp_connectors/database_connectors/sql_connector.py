@@ -3,13 +3,74 @@
 
 from abc import abstractmethod
 from datetime import datetime
+import re
 from typing import Iterator, Dict, Any, List, Optional, Tuple
 
+import pyodbc
 from pyodbc import Cursor
 from loguru import logger
+from ..retry import RetryPolicy
 
-class SqlConnector():
 
+def _sqlstates(error):
+    states = set()
+    for arg in error.args:
+        value = str(arg).upper()
+        if re.fullmatch(r"[A-Z0-9]{5}", value):
+            states.add(value)
+        states.update(re.findall(r"\[([A-Z0-9]{5})\]", value))
+    return states
+
+
+def is_retryable_connection_error(error: Exception, *, connecting=False) -> bool:
+    """Return True only for known temporary ODBC connection failures."""
+    if not isinstance(error, pyodbc.Error):
+        return False
+
+    states = _sqlstates(error)
+
+    # Never retry SQL, data, authentication, or transaction errors.
+    if any(state.startswith(
+        ("07", "21", "22", "23", "24", "25", "28", "40", "42", "IM")
+    ) for state in states):
+        return False
+
+    message = str(error).lower()
+
+    # Never retry known permanent errors.
+    if any(marker in message for marker in (
+        "syntax error", "incorrect syntax", "permission denied", "not authorized",
+        "login failed", "authentication failed", "constraint", "duplicate key",
+        "conversion failed", "certificate verify failed", "certificate chain",
+    )):
+        return False
+
+    # Retry known connection failures.
+    if states & {"08001", "08003", "08006", "08S01", "HYT01"}:
+        return True
+
+    # HYT00 is retryable only while establishing a connection.
+    if connecting and states == {"HYT00"}:
+        return True
+
+    # HY000 is retryable only when its message clearly describes a disconnect.
+    if states - {"HY000"}:
+        return False
+
+    return any(marker in message for marker in (
+        "communication link failure", "connection reset", "connection refused",
+        "connection closed", "connection is closed", "broken pipe",
+    ))
+
+
+def is_parameter_binding_unsupported(error: Exception) -> bool:
+    """Allow Informix literal fallback only for unsupported driver features."""
+    return isinstance(error, pyodbc.Error) and bool(_sqlstates(error)) and (
+        _sqlstates(error) <= {"HYC00", "IM001"}
+    )
+
+
+class SqlConnector(RetryPolicy):
     def __init__(self, host, user, password, port, database):
         self.host = host
         self.user = user
@@ -23,25 +84,73 @@ class SqlConnector():
     def get_connection(self):
         """Returns a connection object from the driver."""
 
+    def _open_connection(self):
+        """Single attempt; retry-enabled drivers override this method."""
+        return self.get_connection()
+
+    def _is_retryable_connection_error(self, error, *, connecting=False):
+        return is_retryable_connection_error(error, connecting=connecting)
+
+    def _run_read_with_retry(self, operation_name, operation, cursor=None):
+        """Replay only an explicitly safe, fully buffered read on owned handles.
+
+        A borrowed cursor may carry a transaction or session state: use it once,
+        without closing it, replacing it, or reconnecting its connection.
+        """
+        if cursor is not None:
+            return operation(cursor)
+        for attempt in self._read_attempts():
+            connection = active_cursor = None
+            try:
+                # Share one budget across connect, cursor creation and reading.
+                connection = self._open_connection()
+                active_cursor = connection.cursor()
+                return operation(active_cursor)
+            except Exception as error:
+                if attempt >= self.max_connection_retries or not self._is_retryable_connection_error(error, connecting=connection is None):
+                    raise
+            finally:
+                self._safe_close(active_cursor)
+                self._safe_close(connection)
+            self._wait_for_retry(operation_name, attempt + 1)
+
+    def _iterate_read_with_retry(self, operation_name, operation, cursor=None, cursor_factory=None):
+        """Retry an owned iterator only before its first yield, never mid-stream."""
+        if cursor is not None:
+            yield from operation(cursor)
+            return
+        emitted = False
+        for attempt in self._read_attempts():
+            connection = active_cursor = iterator = None
+            try:
+                connection = self._open_connection()
+                active_cursor = cursor_factory(connection) if cursor_factory else connection.cursor()
+                iterator = operation(active_cursor)
+                for item in iterator:
+                    emitted = True
+                    yield item
+                return
+            except Exception as error:
+                if emitted or attempt >= self.max_connection_retries or not self._is_retryable_connection_error(error, connecting=connection is None):
+                    raise
+            finally:
+                self._safe_close(iterator)
+                self._safe_close(active_cursor)
+                self._safe_close(connection)
+            self._wait_for_retry(operation_name, attempt + 1)
+
 
     def ping(self):
         """Returns True if the connection is successful, False otherwise."""
-        conn = None
-        cursor = None
+        def _ping(cursor):
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
 
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()  # ensure the query actually ran
+            self._run_read_with_retry("ping", _ping)
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
             return False
-        finally:
-            if cursor:
-                cursor.close()
-            if conn:
-                conn.close()
 
         logger.info("Database connection is active.")
         return True

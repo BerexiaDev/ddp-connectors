@@ -1,5 +1,6 @@
 
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from itertools import islice
 import json
@@ -7,6 +8,8 @@ import uuid
 from loguru import logger
 from typing import Dict, Any, List, Tuple
 from pymongo import MongoClient
+from pymongo.errors import AutoReconnect, ConnectionFailure
+from ..retry import RetryPolicy
 
 from bson import ObjectId
 from bson.decimal128 import Decimal128
@@ -66,7 +69,7 @@ class DecimalCodec(TypeCodec):
 type_registry = TypeRegistry([DecimalCodec()])
 codec_options = CodecOptions(type_registry=type_registry)
 
-class MongoConnector:
+class MongoConnector(RetryPolicy):
 
     def __init__(self, host, user, password, port, database):
         self.host = host
@@ -81,35 +84,48 @@ class MongoConnector:
         # never disagree within a single sync run.
         self._relational_schema_cache: Dict[str, List[Dict[str, Any]]] = {}
 
+    @staticmethod
+    def _is_retryable_connection_error(error, *, connecting=False):
+        return isinstance(error, (AutoReconnect, ConnectionFailure)) and not any(
+            marker in str(error).lower() for marker in ("authentication failed", "not authorized", "certificate verify failed")
+        )
+
     def ping(self) -> bool:
-        """
-        Tests the database connection.
-        Returns True if successful, raises an Exception or returns False if not.
-        """
+        client = None
         try:
             client = self.get_connection()
-            # The 'ping' command is cheap and verifies the server is reachable
-            client.admin.command('ping')
-            logger.info(f"Successfully pinged MongoDB database: {self.database_name}")
             return True
-        except Exception as exc:
-            logger.error(f"MongoDB connection ping failed: {exc}")
+        except Exception as error:
+            logger.error(f"MongoDB connection ping failed: {error}")
             return False
         finally:
-            if 'client' in locals():
-                client.close()
-    
+            self._safe_close(client)
+
     def get_connection(self) -> MongoClient:
-        """
-        Returns a MongoClient instance.
-        """
+        return self._connect_with_retry()
+
+    def _open_connection(self) -> MongoClient:
         if self.user and self.password:
-            # URL encode credentials if they contain special characters in a real-world scenario
             uri = f"mongodb://{self.user}:{self.password}@{self.host}:{self.port}/{self.database_name}?authSource=admin"
         else:
             uri = f"mongodb://{self.host}:{self.port}/{self.database_name}"
-            
-        return MongoClient(uri)
+        # Own the retry budget and never let the driver replay writes implicitly.
+        client = MongoClient(uri, retryReads=False, retryWrites=False)
+        try:
+            # MongoClient construction is lazy: verify initial connectivity here.
+            client.admin.command('ping')
+            return client
+        except BaseException:
+            self._safe_close(client)
+            raise
+
+    @contextmanager
+    def _read_client(self):
+        client = self._open_connection()
+        try:
+            yield client
+        finally:
+            self._safe_close(client)
 
     def insert_data(self, table_name: str, data: List[Dict[str, Any]]) -> int:
         """
@@ -142,17 +158,18 @@ class MongoConnector:
         """
         Fetches a batch of documents using skip and limit.
         """
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            schema = self._relational_schema(table_name)
-            cursor = db[table_name].find().skip(offset).limit(limit)
-            return [self._project_document(doc, schema) for doc in cursor]
-        except Exception as e:
-            logger.error(f"Error fetching batch from {table_name}: {str(e)}")
-            return []
-        finally:
-            client.close()
+        schema = self._relational_schema(table_name)
+        def _read():
+            with self._read_client() as client:
+                cursor = None
+                try:
+                    db = client[self.database_name]
+                    cursor = db[table_name].find().skip(offset).limit(limit)
+                    return [self._project_document(doc, schema) for doc in cursor]
+                finally:
+                    self._safe_close(cursor)
+
+        return self._run_with_retry("fetch_batch", _read)
 
     def stream_batch(self, table_name: str, batch_size: int = 10_000):
         """
@@ -163,47 +180,42 @@ class MongoConnector:
         unmodeled fields in ``_extra``) so the tuples line up positionally with the
         INSERT column list the sync pipeline builds.
         """
-        client = self.get_connection()
-        try:
-            logger.info(f"Start streaming MongoDB collection {table_name} with batch_size={batch_size}")
-            db = client[self.database_name]
-            schema = self._relational_schema(table_name)
+        schema = self._relational_schema(table_name)
+        def _stream():
+            with self._read_client() as client:
+                cursor = None
+                try:
+                    logger.info(f"Start streaming MongoDB collection {table_name} with batch_size={batch_size}")
+                    db = client[self.database_name]
+                    cursor = db[table_name].find(batch_size=batch_size)
+                    while True:
+                        # 1. Grab exactly batch_size items directly from the cursor
+                        chunk = list(islice(cursor, batch_size))
 
-            # batch_size tells the MongoDB driver how many documents to fetch per network round trip
-            cursor = db[table_name].find(batch_size=batch_size)
+                        # If the chunk is empty, we've reached the end of the collection
+                        if not chunk:
+                            break
+                        else:
+                            yield [self._project_document(doc, schema) for doc in chunk]
+                    logger.info(f"Finished streaming MongoDB collection {table_name}")
+                finally:
+                    self._safe_close(cursor)
 
-            while True:
-                # 1. Grab exactly batch_size items directly from the cursor
-                chunk = list(islice(cursor, batch_size))
-
-                # If the chunk is empty, we've reached the end of the collection
-                if not chunk:
-                    break
-                else:
-                    yield [self._project_document(doc, schema) for doc in chunk]
-
-            logger.info(f"Finished streaming MongoDB collection {table_name}")
-        except Exception as exc:
-            logger.error(f"Error streaming batch from MongoDB collection {table_name}: {exc}")
-        finally:
-            client.close()
+        yield from self._iterate_with_retry("stream_batch", _stream)
 
     def get_connection_tables(self) -> List[str]:
         """Returns a list of collections in the database."""
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            collections = db.list_collection_names()
-            logger.info(f"Collections: {collections}")
-            return collections
-        except Exception as e:
-            logger.error(f"Error getting collections: {e}")
-            return []
-        finally:
-            client.close()
+        def _read():
+            with self._read_client() as client:
+                db = client[self.database_name]
+                collections = db.list_collection_names()
+                logger.info(f"Collections: {collections}")
+                return collections
+
+        return self._run_with_retry("get_connection_tables", _read)
 
     # Documents collapsed into the (id, data) storage contract used by the sync
-    # pipeline. Returned as a safe fallback whenever live schema inference can't run.
+    # pipeline. Used only when a successful schema sample contains no fields.
     _FALLBACK_COLUMNS = [
         {"name": "id", "type": "string", "alias": "id"},
         {"name": "data", "type": "record", "alias": "data"},
@@ -223,35 +235,31 @@ class MongoConnector:
           - types        : the full observed type distribution
 
         Falls back to the (id, data) storage contract if the collection is empty or
-        sampling fails, so existing callers keep working.
+        sampling returns no fields, so existing callers keep working.
         """
-        try:
-            catalog = self.profile_collection_schema(table_name, sample_size=sample_size)
-            fields = catalog.get("fields", [])
+        catalog = self.profile_collection_schema(table_name, sample_size=sample_size)
+        fields = catalog.get("fields", [])
 
-            columns = []
-            for field in fields:
-                path = field["path"]
-                # Only surface top-level scalar/record fields as columns; nested and
-                # array-element paths (containing "." or "[]") live inside the catalog.
-                if "." in path or "[]" in path:
-                    continue
-                columns.append({
-                    "name": path,
-                    "alias": path,
-                    # Type off the dominant NON-NULL type so a mostly-null field still shows
-                    # its real type (and stays consistent with the storage column type).
-                    "type": PLATFORM_TYPE_MAP.get(self._effective_type(field), "string"),
-                    "presence_pct": field["presence_pct"],
-                    "nullable": field["nullable"],
-                    "polymorphic": field["polymorphic"],
-                    "types": field["types"],
-                })
+        columns = []
+        for field in fields:
+            path = field["path"]
+            # Only surface top-level scalar/record fields as columns; nested and
+            # array-element paths (containing "." or "[]") live inside the catalog.
+            if "." in path or "[]" in path:
+                continue
+            columns.append({
+                "name": path,
+                "alias": path,
+                # Type off the dominant NON-NULL type so a mostly-null field still shows
+                # its real type (and stays consistent with the storage column type).
+                "type": PLATFORM_TYPE_MAP.get(self._effective_type(field), "string"),
+                "presence_pct": field["presence_pct"],
+                "nullable": field["nullable"],
+                "polymorphic": field["polymorphic"],
+                "types": field["types"],
+            })
 
-            return columns or list(self._FALLBACK_COLUMNS)
-        except Exception as e:
-            logger.error(f"Error inferring columns for {table_name}, using fallback: {e}")
-            return list(self._FALLBACK_COLUMNS)
+        return columns or list(self._FALLBACK_COLUMNS)
 
     def profile_collection_schema(self, table_name: str, sample_size: int = 1000) -> Dict[str, Any]:
         """
@@ -275,25 +283,19 @@ class MongoConnector:
               "fields": [ { ...catalog entry... }, ... ]
             }
         """
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            collection = db[table_name]
-            try:
-                docs = list(collection.aggregate(
+        def _read():
+            with self._read_client() as client:
+                db = client[self.database_name]
+                collection = db[table_name]
+                with collection.aggregate(
                     [{"$sample": {"size": sample_size}}], allowDiskUse=True
-                ))
-            except Exception as exc:
-                # $sample needs a non-empty collection / certain storage engines; fall
-                # back to a plain bounded scan.
-                logger.warning(f"$sample failed for {table_name} ({exc}); falling back to find().limit()")
-                docs = list(collection.find().limit(sample_size))
+                ) as cursor:
+                    docs = list(cursor)
+                fields = self._infer_field_catalog(docs)
+                logger.info(f"Inferred {len(fields)} field paths from {len(docs)} sampled docs in {table_name}")
+                return {"collection": table_name, "sampled": len(docs), "fields": fields}
 
-            fields = self._infer_field_catalog(docs)
-            logger.info(f"Inferred {len(fields)} field paths from {len(docs)} sampled docs in {table_name}")
-            return {"collection": table_name, "sampled": len(docs), "fields": fields}
-        finally:
-            client.close()
+        return self._run_with_retry("profile_collection_schema", _read)
 
     def _infer_field_catalog(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -453,38 +455,36 @@ class MongoConnector:
         return suggestions
 
     def count_table_rows(self, table_name: str) -> int:
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            return db[table_name].count_documents({})
-        except Exception as e:
-            logger.error(f"Error getting table total rows: {str(e)}")
-            return 0
-        finally:
-            client.close()
+        def _read():
+            with self._read_client() as client:
+                db = client[self.database_name]
+                return db[table_name].count_documents({})
+
+        return self._run_with_retry("count_table_rows", _read)
 
     def get_min_max_date(self, table_name: str, column_name: str) -> Tuple[Any, Any]:
         """Uses aggregation to find the min and max dates/values for a specific field."""
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            pipeline = [
-                {"$match": {column_name: {"$exists": True, "$ne": None}}},
-                {"$group": {
-                    "_id": None,
-                    "min_val": {"$min": f"${column_name}"},
-                    "max_val": {"$max": f"${column_name}"}
-                }}
-            ]
-            result = list(db[table_name].aggregate(pipeline))
-            if result:
-                return result[0].get("min_val"), result[0].get("max_val")
-            return None, None
-        finally:
-            client.close()
+        def _read():
+            with self._read_client() as client:
+                db = client[self.database_name]
+                pipeline = [
+                    {"$match": {column_name: {"$exists": True, "$ne": None}}},
+                    {"$group": {
+                        "_id": None,
+                        "min_val": {"$min": f"${column_name}"},
+                        "max_val": {"$max": f"${column_name}"}
+                    }}
+                ]
+                with db[table_name].aggregate(pipeline) as cursor:
+                    result = list(cursor)
+                if result:
+                    return result[0].get("min_val"), result[0].get("max_val")
+                return None, None
+
+        return self._run_with_retry("get_min_max_date", _read)
 
     # Two-column shape used only as a last-resort fallback when a collection is empty
-    # or schema inference fails, so the sync pipeline still has a valid table to target.
+    # or schema inference returns no fields, so the sync pipeline still has a valid table to target.
     _FALLBACK_TABLE_SCHEMA = [
         {"position": 0, "name": "_id", "type": "TEXT", "length": None, "nullable": "NO",
          "default": None, "primary_key": "YES", "foreign_key": "NO", "is_index": "NO"},
@@ -508,7 +508,7 @@ class MongoConnector:
         that stream_batch()/fetch_batch() project rows in the exact same column order.
 
         Falls back to the legacy ``(id, data)`` shape if the collection is empty or
-        sampling fails.
+        sampling returns no fields.
         """
         return self._relational_schema(table_name)
 
@@ -517,12 +517,8 @@ class MongoConnector:
         if table_name in self._relational_schema_cache:
             return self._relational_schema_cache[table_name]
 
-        try:
-            catalog = self.profile_collection_schema(table_name, sample_size=sample_size)
-            schema = self._relational_schema_from_catalog(catalog)
-        except Exception as exc:
-            logger.error(f"Failed to infer relational schema for {table_name}, using fallback: {exc}")
-            schema = list(self._FALLBACK_TABLE_SCHEMA)
+        catalog = self.profile_collection_schema(table_name, sample_size=sample_size)
+        schema = self._relational_schema_from_catalog(catalog)
 
         self._relational_schema_cache[table_name] = schema
         return schema
@@ -701,55 +697,49 @@ class MongoConnector:
         Mimics the ROW_NUMBER() window function from SQL by using an Aggregation Pipeline.
         Groups by primary_key, sorts by Date_operation descending, and takes the first document.
         """
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            
-            pipeline = [
-                # 1. Filter records newer than since_ts
-                {"$match": {"Date_operation": {"$gt": since_ts}}},
-                # 2. Sort by date descending so the newest is first
-                {"$sort": {"Date_operation": -1}},
-                # 3. Group by the primary key, and keep ONLY the first document (the newest one)
-                {"$group": {
-                    "_id": f"${primary_key}",
-                    "latest_doc": {"$first": "$$ROOT"}
-                }},
-                # 4. Flatten the structure back to normal
-                {"$replaceRoot": {"newRoot": "$latest_doc"}},
-                # 5. Final sort (optional, depending on your downstream needs)
-                {"$sort": {primary_key: 1, "Date_operation": -1}}
-            ]
-            
-            cursor = db[log_table].aggregate(pipeline, batchSize=batch_size)
-            
-            for doc in cursor:
-                yield doc
-                
-        finally:
-            client.close()
+        def _stream():
+            with self._read_client() as client:
+                cursor = None
+                try:
+                    db = client[self.database_name]
+                    pipeline = [
+                        # 1. Filter records newer than since_ts
+                        {"$match": {"Date_operation": {"$gt": since_ts}}},
+                        # 2. Sort by date descending so the newest is first
+                        {"$sort": {"Date_operation": -1}},
+                        # 3. Group by the primary key, and keep ONLY the first document (the newest one)
+                        {"$group": {
+                            "_id": f"${primary_key}",
+                            "latest_doc": {"$first": "$$ROOT"}
+                        }},
+                        # 4. Flatten the structure back to normal
+                        {"$replaceRoot": {"newRoot": "$latest_doc"}},
+                        # 5. Final sort (optional, depending on your downstream needs)
+                        {"$sort": {primary_key: 1, "Date_operation": -1}}
+                    ]
+                    cursor = db[log_table].aggregate(pipeline, batchSize=batch_size)
+                    for doc in cursor:
+                        yield doc
+                finally:
+                    self._safe_close(cursor)
+
+        yield from self._iterate_with_retry("fetch_deltas", _stream)
 
     def get_table_indexes(self, table_name: str) -> list:
         """Returns a list of indexes for the given collection."""
-        client = self.get_connection()
-        try:
-            db = client[self.database_name]
-            index_info = db[table_name].index_information()
-            
-            indexes = []
-            for name, info in index_info.items():
-                # 'key' is typically a list of tuples like [('field_name', 1)]
-                columns = [k[0] for k in info.get('key', [])]
-                indexes.append({"name": name, "columns": columns})
-            
-            logger.info(f"indexes ==> {indexes}")
-                
-            return indexes
-        except Exception as e:
-            logger.error(f"Error getting indexes for {table_name}: {e}")
-            return []
-        finally:
-            client.close()
+        def _read():
+            with self._read_client() as client:
+                db = client[self.database_name]
+                index_info = db[table_name].index_information()
+                indexes = []
+                for name, info in index_info.items():
+                    # 'key' is typically a list of tuples like [('field_name', 1)]
+                    columns = [k[0] for k in info.get('key', [])]
+                    indexes.append({"name": name, "columns": columns})
+                logger.info(f"indexes ==> {indexes}")
+                return indexes
+
+        return self._run_with_retry("get_table_indexes", _read)
 
     def build_create_table_statement(self, table_name: str, columns: List[Dict[str, Any]]) -> str:
         """In MongoDB, databases and collections are created lazily upon the first insert."""

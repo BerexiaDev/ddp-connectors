@@ -5,6 +5,14 @@ class ConnectorFactory():
         pass
     
     def create_connector(self, connector_type, connector_settings):
+        connector = self._create_connector(connector_type, connector_settings)
+        for setting in ("max_connection_retries", "retry_backoff_seconds"):
+            if setting in connector_settings:
+                setattr(connector, setting, connector_settings[setting])
+        connector._read_attempts()  # Validate retry settings before doing any IO.
+        return connector
+
+    def _create_connector(self, connector_type, connector_settings):
 
         if connector_type == 'sftp':
             from ddp_connectors.file_connectors.sftp_connector import SftpConnector
