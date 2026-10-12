@@ -64,9 +64,20 @@ def is_retryable_connection_error(error: Exception, *, connecting=False) -> bool
 
 
 def is_parameter_binding_unsupported(error: Exception) -> bool:
-    """Allow Informix literal fallback only for unsupported driver features."""
-    return isinstance(error, pyodbc.Error) and bool(_sqlstates(error)) and (
-        _sqlstates(error) <= {"HYC00", "IM001"}
+    """Check whether a known driver problem allows another query format."""
+    if not isinstance(error, pyodbc.Error):
+        return False
+
+    states = _sqlstates(error)
+    if states and states <= {"HYC00", "IM001"}:
+        return True
+
+    first_arg = str(error.args[0]).strip().upper() if error.args else ""
+    message = str(error).upper()
+    return (
+        first_arg == "1020"
+        and "[DATADIRECT][ODBC 20101 DRIVER]" in message
+        and "(SQLEXECDIRECTW)" in message
     )
 
 
