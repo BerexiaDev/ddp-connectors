@@ -40,6 +40,16 @@ class ConnectorContracts(unittest.TestCase):
         self.assertEqual(self.pg.build_create_table_statement("empty"),
                          ('CREATE TABLE IF NOT EXISTS "public"."empty" (\n  \n);', None))
 
+    def test_factory_validates_database_retry_settings(self):
+        settings = dict(host="host", user="user", password="password", port=1234,
+                        database="database")
+        for kind in ("postgres", "mongo"):
+            for invalid in ({"max_connection_retries": -1}, {"max_connection_retries": "3"},
+                            {"retry_backoff_seconds": -1}, {"retry_backoff_seconds": float("inf")}):
+                with self.subTest(kind=kind, settings=invalid):
+                    with self.assertRaises(ValueError):
+                        ConnectorFactory().create_connector(kind, {**settings, **invalid})
+
     def test_schema_and_legacy_filter_arguments(self):
         filters = [{"column": "id", "value": 1}]
         self.assertEqual(self.pg.coerce_schema_and_filters(filters), (None, filters))

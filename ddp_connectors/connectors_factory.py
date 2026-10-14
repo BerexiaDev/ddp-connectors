@@ -1,3 +1,6 @@
+from ddp_connectors.retry import RetryPolicy
+
+
 class ConnectorFactory():
     """Helper class that provides a standard way to create a Data Checker using factory method"""
     
@@ -6,10 +9,11 @@ class ConnectorFactory():
     
     def create_connector(self, connector_type, connector_settings):
         connector = self._create_connector(connector_type, connector_settings)
-        for setting in ("max_connection_retries", "retry_backoff_seconds"):
-            if setting in connector_settings:
-                setattr(connector, setting, connector_settings[setting])
-        connector._read_attempts()  # Validate retry settings before doing any IO.
+        if isinstance(connector, RetryPolicy):
+            for setting in ("max_connection_retries", "retry_backoff_seconds"):
+                if setting in connector_settings:
+                    setattr(connector, setting, connector_settings[setting])
+            connector._read_attempts()  # Validate retry settings before doing any IO.
         return connector
 
     def _create_connector(self, connector_type, connector_settings):
