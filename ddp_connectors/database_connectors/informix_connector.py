@@ -6,11 +6,12 @@ import pyodbc
 from loguru import logger
 from pyodbc import Cursor
 
-from .sql_connector import SqlConnector
+from .sql_connector import SqlConnector, is_parameter_binding_unsupported
 from .sql_connector_utils import cast_informix_to_typescript_types, cast_informix_to_postgresql_type, safe_convert_to_string, normalize_ui_column_type
 
 
 class InformixConnector(SqlConnector):
+    supports_owned_read_cursor = True
 
     def __init__(self, host, user, password, port, database, protocol, locale):
         super().__init__(host, user, password, port, database)
@@ -28,6 +29,9 @@ class InformixConnector(SqlConnector):
         return query
 
     def get_connection(self):
+        return self._connect_with_retry()
+
+    def _open_connection(self):
         conn_str = (
             f"DRIVER={self.driver_path};"
             f"DATABASE={self.database};"
@@ -41,18 +45,19 @@ class InformixConnector(SqlConnector):
             "LoginTimeout=10;"
         )
         conn = pyodbc.connect(conn_str, timeout=10)
-        # Set decoding to ISO-8859-1 (en_US.819) for both SQL_CHAR and SQL_WCHAR
-        conn.setdecoding(pyodbc.SQL_CHAR, encoding='latin1')  # ISO-8859-1 = Latin-1
-        conn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')  # In case of wide chars
+        try:
+            conn.setdecoding(pyodbc.SQL_CHAR, encoding='latin1')
+            conn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')
+        except BaseException:
+            self._safe_close(conn)
+            raise
         return conn
 
     def _qualify_table_sql(self, table_name: str, schema: Optional[str] = None) -> str:
         return self.qualify_table_name(table_name, schema)
 
     def get_connection_schemas(self) -> List[str]:
-        connection = self.get_connection()
-        cursor = connection.cursor()
-        try:
+        def _read(cursor):
             logger.info(
                 f"[informix][schema_discovery] database={self.database} schema_equivalent=owner query_path=systables"
             )
@@ -65,49 +70,37 @@ class InformixConnector(SqlConnector):
                 """
             )
             return [row[0].strip() for row in cursor.fetchall() if row[0]]
-        except Exception as e:
-            logger.error(
-                f"[informix][schema_discovery] database={self.database} schema_equivalent=owner query_path=systables failed: {e}"
-            )
-            return []
-        finally:
-            cursor.close()
-            connection.close()
+
+        return self._run_read_with_retry("get_connection_schemas", _read)
     
     
     def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100, filters=None, schema: Optional[str] = None):
-        qualified_table = self._qualify_table_sql(table_name, schema)
-        query = f"SELECT SKIP {offset} FIRST {limit} * FROM {qualified_table};"
-        logger.info(f"Fetching batch: table={qualified_table}, offset={offset}, limit={limit}")
-        connection = self.get_connection()
-        cursor = connection.execute(query)
-        try:
+        def _read(cursor):
+            qualified_table = self._qualify_table_sql(table_name, schema)
+            query = f"SELECT SKIP {offset} FIRST {limit} * FROM {qualified_table};"
+            logger.info(f"Fetching batch: table={qualified_table}, offset={offset}, limit={limit}")
+            cursor.execute(query)
             rows = cursor.fetchall()
             column_names = [col[0] for col in cursor.description]
             return [
                 {col: safe_convert_to_string(row[i]) for i, col in enumerate(column_names)}
                 for row in rows
             ]
-        except Exception as e:
-            logger.error(f"Error extracting batch from {table_name}: {str(e)}")
-            return []
-        finally:
-            cursor.close()
-            connection.close()
+
+        return self._run_read_with_retry("extract_data_batch", _read)
 
 
 
     def fetch_batch(self, cursor: Cursor, table_name, offset: int, batch_size: int = 100, schema: Optional[str] = None, **kwargs):
-        try:
+        def _read(cursor):
             limit = kwargs.get("limit", batch_size)
             qualified_table = self._qualify_table_sql(table_name, schema)
             query = f"SELECT SKIP {offset} FIRST {limit} * FROM {qualified_table}"
             cursor.execute(query)
             results = cursor.fetchall()
             return results
-        except Exception as e:
-            logger.error(f"Error fetching batch from {table_name}: {str(e)}")
-            return []
+
+        return self._run_read_with_retry("fetch_batch", _read, cursor=cursor)
 
     def stream_batch(self, cursor: pyodbc.Cursor, table_name: str, batch_size: int = 10_000, schema: Optional[str] = None):
         """
@@ -115,7 +108,7 @@ class InformixConnector(SqlConnector):
         Uses a single SELECT and fetchmany to avoid performance degradation.
         Suitable for truncate + reload scenarios.
         """
-        try:
+        def _stream(cursor):
             cursor.arraysize = batch_size
             qualified_table = self._qualify_table_sql(table_name, schema)
             logger.info(f"Start streaming Informix table {qualified_table} with batch_size={batch_size}")
@@ -130,15 +123,11 @@ class InformixConnector(SqlConnector):
 
             logger.info(f"Finished streaming Informix table {qualified_table}")
 
-        except Exception as exc:
-            logger.error(f"Error streaming batch from Informix table {table_name}: {exc}")
-            return
+        yield from self._iterate_read_with_retry("stream_batch", _stream, cursor=cursor)
 
     def get_connection_tables(self, schema: Optional[str] = None):
-        connection = self.get_connection()
-        cursor = connection.cursor()
-        target_schema = self._normalize_identifier(schema) or self.schema
-        try:
+        def _read(cursor):
+            target_schema = self._normalize_identifier(schema) or self.schema
             if target_schema:
                 sql = """
                     SELECT tabname
@@ -153,7 +142,9 @@ class InformixConnector(SqlConnector):
                         f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables parameter_binding=tuple"
                     )
                     cursor.execute(sql, (target_schema,))
-                except Exception:
+                except Exception as error:
+                    if not is_parameter_binding_unsupported(error):
+                        raise
                     safe_schema = target_schema.replace("'", "''")
                     logger.info(
                         f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables fallback=escaped_literal"
@@ -183,20 +174,12 @@ class InformixConnector(SqlConnector):
                 )
             tables = [row[0] for row in cursor.fetchall()]
             return tables
-        except Exception as e:
-            logger.error(
-                f"[informix][table_discovery] database={self.database} selected_schema={target_schema} schema_equivalent=owner query_path=informix.systables failed: {e}"
-            )
-            return []
-        finally:
-            cursor.close()
-            connection.close()
+
+        return self._run_read_with_retry("get_connection_tables", _read)
 
     def get_connection_columns(self, table_name, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        try:
+        def _read(cursor):
+            target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
             query = """
                 SELECT c.colname, c.coltype
                 FROM informix.syscolumns c
@@ -214,7 +197,9 @@ class InformixConnector(SqlConnector):
                     f"[informix][column_discovery] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns/informix.systables parameter_binding=tuple"
                 )
                 cursor.execute(query, tuple(params))
-            except Exception:
+            except Exception as error:
+                if not is_parameter_binding_unsupported(error):
+                    raise
                 safe_table = pure_table.replace("'", "''")
                 if target_schema:
                     safe_schema = target_schema.replace("'", "''")
@@ -251,126 +236,54 @@ class InformixConnector(SqlConnector):
                 for row in rows
             ]
             return columns
-        except Exception as e:
-            logger.error(
-                f"[informix][column_discovery] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns/informix.systables failed: {e}"
-            )
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_connection_columns", _read)
     
     def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
-        schema, _ = self.coerce_schema_and_filters(schema, filters)
-        qualified_table = self._qualify_table_sql(table_name, schema)
-        connection = self.get_connection()
-        cursor = connection.cursor()
-        try:
+        def _read(cursor):
+            resolved_schema, _ = self.coerce_schema_and_filters(schema, filters)
+            qualified_table = self._qualify_table_sql(table_name, resolved_schema)
             count_result = cursor.execute(f"SELECT COUNT(*) FROM {qualified_table}").fetchone()
             total_count = int(count_result[0]) if count_result else 0
             return total_count
-        except Exception as e:
-            logger.error(f"Error getting table total rows: {str(e)}")
-            raise 0
-        finally:
-            cursor.close()
-            connection.close()
+
+        return self._run_read_with_retry("count_table_rows", _read)
     
     
     def get_database_schema(self) -> Dict[str, Dict]:
-        try:
-            # TODO: Use the connector to get the schema based on the connector type
-            logger.debug("Getting database schema for Informix using pyodbc")
+        def _read(cursor):
+            cursor.execute("""
+                SELECT DISTINCT tabname, owner FROM systables
+                WHERE tabtype = 'T' AND tabid >= 100
+            """)
             tables = {}
-            cursor = self.get_connection().cursor()
-            
-            # First, get the current database
-            try:
-                cursor.execute("SELECT TRIM(DBINFO('dbname')) FROM systables WHERE tabid = 1")
-                current_db = cursor.fetchone()[0]
-                logger.debug(f"Current database: {current_db}")
-            except Exception as db_err:
-                logger.warning(f"Could not get current database: {db_err}")
-                current_db = None
-            
-            # Get all user tables from Informix with more inclusive query
-            table_query = """
-                SELECT DISTINCT
-                    t.tabname,
-                    t.owner
-                FROM systables t
-                WHERE t.tabtype = 'T'
-                AND t.tabid >= 100  -- User tables typically start from 100
-            """
-            logger.debug(f"Executing table query: {table_query}")
-            cursor.execute(table_query)
-            table_rows = cursor.fetchall()
-            
-            logger.debug(f"Found {len(table_rows)} tables")
-            
-            for table_row in table_rows:
-                table_name = table_row[0].strip()
-                owner = table_row[1].strip() if table_row[1] else None
-                
-                logger.debug(f"Processing table: {table_name}, owner: {owner}")
-                
-                # Get columns for each table
-                column_query = f"""
-                    SELECT 
-                        c.colname,
-                        c.coltype,
-                        c.collength
-                    FROM syscolumns c
-                    JOIN systables t ON c.tabid = t.tabid
-                    WHERE t.tabname = '{table_name}'
-                    ORDER BY c.colno
-                """
-                
-                try:
-                    logger.debug(f"Getting columns for table {table_name}")
-                    cursor.execute(column_query)
-                    columns = cursor.fetchall()
-                    
-                    if columns:
-                        # Build columns list while logging each column's info
-                        column_list = []
-                        for col in columns:
-                            col_name = col[0].strip()
-                            col_type = cast_informix_to_typescript_types(col[1])
-                            logger.debug(f"Column {col_name} has type {col[1]} wihch is {col_type}")
-                            column_list.append({
-                                'name': col_name,
-                                'type': col_type,
-                                'length': col[2]
-                            })
-                            
-                        table_info = {
-                            'name': table_name,
-                            'owner': owner,
-                            'columns': column_list
-                        }
-                        
-                        tables[table_name] = table_info
-                        logger.debug(f"Added table {table_name} with {len(columns)} columns")
-                except Exception as col_err:
-                    logger.error(f"Error getting columns for table {table_name}: {col_err}")
-                    continue
-                
-            logger.debug(f"Retrieved schema for {len(tables)} tables")
-            if len(tables) == 0:
-                logger.warning("No tables found in the schema")
-                
+            for row in cursor.fetchall():
+                table_name = row[0].strip()
+                owner = row[1].strip() if row[1] else None
+                cursor.execute("""
+                    SELECT c.colname, c.coltype, c.collength
+                    FROM syscolumns c JOIN systables t ON c.tabid = t.tabid
+                    WHERE t.tabname = ? AND t.owner = ? ORDER BY c.colno
+                """, (table_name, owner))
+                columns = cursor.fetchall()
+                if columns:
+                    tables[table_name] = {
+                        "name": table_name,
+                        "owner": owner,
+                        "columns": [
+                            {"name": col[0].strip(),
+                             "type": cast_informix_to_typescript_types(col[1]),
+                             "length": col[2]}
+                            for col in columns
+                        ],
+                    }
             return tables
-        except Exception as e:
-            logger.error(f"Error getting database schema: {str(e)}")
-            raise ValueError(f"Failed to retrieve database schema: {str(e)}")
-        
-        
+
+        return self._run_read_with_retry("get_database_schema", _read)
+
     def extract_table_schema(self, table_name, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        try:
+        def _read(cursor):
+            target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
             query = """
                 SELECT
                 c.colno      AS ordinal_position,
@@ -448,7 +361,9 @@ class InformixConnector(SqlConnector):
                     f"[informix][extract_table_schema] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix catalog tables parameter_binding=tuple"
                 )
                 cursor.execute(query, tuple(params))
-            except Exception:
+            except Exception as error:
+                if not is_parameter_binding_unsupported(error):
+                    raise
                 safe_table = pure_table.replace("'", "''")
                 fallback_query = query.replace("?", f"'{safe_table}'", 1)
                 if target_schema:
@@ -476,15 +391,8 @@ class InformixConnector(SqlConnector):
                 for col in rows
             ]
             return columns
-        
-        except Exception as e:
-            logger.error(
-                f"[informix][extract_table_schema] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix catalog tables failed: {str(e)}"
-            )
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("extract_table_schema", _read)
 
     def fetch_deltas(
         self,
@@ -495,41 +403,39 @@ class InformixConnector(SqlConnector):
         batch_size: int = 10_000,
         schema: Optional[str] = None,
     ):
-        primary_keys = self.normalize_primary_keys(primary_keys)
-        qualified_log_table = self._qualify_table_sql(log_table, schema)
-        if not primary_keys:
-            logger.error("fetch_deltas requires at least one primary key column.")
-            return
+        def _stream(cursor):
+            keys = self.normalize_primary_keys(primary_keys)
+            qualified_log_table = self._qualify_table_sql(log_table, schema)
+            if not keys:
+                raise ValueError("fetch_deltas requires at least one primary key column.")
+            pk_match = " AND ".join(f"lt2.{pk} = lt1.{pk}" for pk in keys)
+            order_by = ", ".join(keys)
+            sql = f"""
+                SELECT SKIP ? FIRST ? *
+                FROM {qualified_log_table} lt1
+                WHERE lt1.Date_operation = (
+                    SELECT MAX(lt2.Date_operation)
+                    FROM {qualified_log_table} lt2
+                    WHERE {pk_match}
+                    AND lt2.Date_operation > ?
+                )
+                AND lt1.Date_operation > ?
+                ORDER BY {order_by};
+            """
+            offset = 0
+            while True:
+                cursor.execute(sql, (offset, batch_size, since_ts, since_ts))
+                rows = cursor.fetchall()
+                if not rows:
+                    break
 
-        # Build composite key condition and ORDER BY
-        pk_match = " AND ".join(f"lt2.{pk} = lt1.{pk}" for pk in primary_keys)
-        order_by = ", ".join(primary_keys)
+                col_names = [c[0] for c in cursor.description]
+                for tup in rows:
+                    yield dict(zip(col_names, tup))
 
-        sql = f"""
-            SELECT SKIP ? FIRST ? *
-            FROM {qualified_log_table} lt1
-            WHERE lt1.Date_operation = (
-                SELECT MAX(lt2.Date_operation)
-                FROM {qualified_log_table} lt2
-                WHERE {pk_match}
-                AND lt2.Date_operation > ?
-            )
-            AND lt1.Date_operation > ?
-            ORDER BY {order_by};
-        """
+                offset += batch_size
 
-        offset = 0
-        while True:
-            cursor.execute(sql, (offset, batch_size, since_ts, since_ts))
-            rows = cursor.fetchall()
-            if not rows:
-                break
-
-            col_names = [c[0] for c in cursor.description]
-            for tup in rows:
-                yield dict(zip(col_names, tup))
-
-            offset += batch_size
+        yield from self._iterate_read_with_retry("fetch_deltas", _stream, cursor=cursor)
 
 
     def get_min_max_date(self, table_name: str, column_name: str, schema: Optional[str] = None):
@@ -537,10 +443,8 @@ class InformixConnector(SqlConnector):
         Returns (min_value, max_value) for a DATE / DATETIME column in an Informix table.
         Assumes snake_case identifiers (no spaces), so no quoting.
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        qualified_table = self._qualify_table_sql(table_name, schema)
-        try:
+        def _read(cursor):
+            qualified_table = self._qualify_table_sql(table_name, schema)
             sql = f"""
                 SELECT MIN({column_name}) AS min_val, MAX({column_name}) AS max_val
                 FROM {qualified_table}
@@ -550,14 +454,11 @@ class InformixConnector(SqlConnector):
             cursor.execute(sql)
             row = cursor.fetchone()
             return (row[0], row[1]) if row else (None, None)
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_min_max_date", _read)
 
     def get_table_indexes(self, table_name: str, schema: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        try:
+        def _read(cursor):
             target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
 
             logger.info(
@@ -580,7 +481,9 @@ class InformixConnector(SqlConnector):
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.systables parameter_binding=tuple"
                 )
                 cursor.execute(sql_tabid, tuple(params))
-            except Exception:
+            except Exception as error:
+                if not is_parameter_binding_unsupported(error):
+                    raise
                 safe_table = pure_table.replace("'", "''")
                 fallback_query = sql_tabid.replace("?", f"'{safe_table}'", 1)
                 if target_schema:
@@ -612,7 +515,9 @@ class InformixConnector(SqlConnector):
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysindexes parameter_binding=tuple tabid={tabid}"
                 )
                 cursor.execute(sql_idx, (tabid,))
-            except Exception:
+            except Exception as error:
+                if not is_parameter_binding_unsupported(error):
+                    raise
                 logger.debug(
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysindexes fallback=int_literal tabid={tabid}"
                 )
@@ -630,7 +535,9 @@ class InformixConnector(SqlConnector):
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns parameter_binding=tuple tabid={tabid}"
                 )
                 cursor.execute(sql_columns, (tabid,))
-            except Exception:
+            except Exception as error:
+                if not is_parameter_binding_unsupported(error):
+                    raise
                 logger.debug(
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.syscolumns fallback=int_literal tabid={tabid}"
                 )
@@ -651,7 +558,9 @@ class InformixConnector(SqlConnector):
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysconstraints parameter_binding=tuple tabid={tabid}"
                 )
                 cursor.execute(sql_constraints, (tabid,))
-            except Exception:
+            except Exception as error:
+                if not is_parameter_binding_unsupported(error):
+                    raise
                 logger.debug(
                     f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema} table={pure_table} query_path=informix.sysconstraints fallback=int_literal tabid={tabid}"
                 )
@@ -701,11 +610,4 @@ class InformixConnector(SqlConnector):
             )
             return results
 
-        except Exception as e:
-            logger.error(
-                f"[informix][get_table_indexes] database={self.database} selected_schema={target_schema if 'target_schema' in locals() else None} table={pure_table if 'pure_table' in locals() else table_name} failed: {e}"
-            )
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+        return self._run_read_with_retry("get_table_indexes", _read)

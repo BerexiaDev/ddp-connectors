@@ -1,0 +1,7 @@
+# Connector runtime pins from existing Core API/Sync consumers (Python 3.10).
+pymongo==3.10.1
+cryptography==44.0.2
+bcrypt==4.1.2
+numpy==1.23.5
+pandas==1.5.3
+oracledb==3.4.2
