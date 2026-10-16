@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from .sql_connector import SqlConnector
+from .connection_errors import jdbc_connection_error
 from .sql_connector_utils import (
     safe_convert_to_string,
     cast_db2i_to_typescript_types,
@@ -33,6 +34,9 @@ class Db2iConnector(SqlConnector):
     The path to jt400.jar is taken from the JT400_JAR environment variable (set in the
     service Dockerfiles), falling back to a vendored location under app/main/drivers/.
     """
+
+    supports_owned_read_cursor = True
+    _is_retryable_connection_error = staticmethod(jdbc_connection_error)
 
     def __init__(self, host, user, password, port, database, schema=None):
         super().__init__(host, user, password, port, database)
@@ -82,6 +86,9 @@ class Db2iConnector(SqlConnector):
         return f'"{pure}"'
 
     def get_connection(self):
+        return self._connect_with_retry()
+
+    def _open_connection(self):
         """Returns a DB-API 2.0 connection backed by the JTOpen JDBC driver."""
         # Lazy import: keeps this module importable (and the factory working for the
         # other connectors) even when jaydebeapi/JPype1 are not installed.
@@ -109,25 +116,16 @@ class Db2iConnector(SqlConnector):
         )
 
     def ping(self):
-        """Returns True if the connection is successful, False otherwise."""
-        conn = None
-        cursor = None
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            # Db2 for i has no bare "SELECT 1"; use the SYSIBM.SYSDUMMY1 catalog table.
+        def _ping(cursor):
             cursor.execute("SELECT 1 FROM SYSIBM.SYSDUMMY1")
             cursor.fetchone()
-            logger.info("Database connection is active.")
             return True
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
+
+        try:
+            return self._run_read_with_retry("ping", _ping)
+        except Exception as error:
+            logger.error(f"Database connection failed: {error}")
             return False
-        finally:
-            if cursor:
-                cursor.close()
-            if conn:
-                conn.close()
 
     def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100) -> List[dict]:
         query = (
@@ -136,50 +134,39 @@ class Db2iConnector(SqlConnector):
             f"FETCH FIRST {limit} ROWS ONLY"
         )
         logger.info(f"Fetching batch: table={table_name}, offset={offset}, limit={limit}")
-        conn = self.get_connection()
-        cur = conn.cursor()
-        try:
+        def _read(cur):
             cur.execute(query)
             cols = [c[0] for c in cur.description]
             return [
                 {col: safe_convert_to_string(row[idx]) for idx, col in enumerate(cols)}
                 for row in cur.fetchall()
             ]
-        except Exception as exc:
-            logger.error(f"Error extracting batch from {table_name}: {exc}")
-            return []
-        finally:
-            cur.close()
-            conn.close()
+
+        return self._run_read_with_retry("extract_data_batch", _read)
 
     def fetch_batch(self, cursor, table_name: str, offset: int, limit: int = 100):
-        try:
+        def _read(cursor):
             query = (
                 f"SELECT * FROM {self._qualify(table_name)} "
                 f"OFFSET {offset} ROWS FETCH FIRST {limit} ROWS ONLY"
             )
             cursor.execute(query)
             return cursor.fetchall()
-        except Exception as exc:
-            logger.error(f"Error fetching batch from {table_name}: {exc}")
-            return []
+
+        return self._run_read_with_retry("fetch_batch", _read, cursor=cursor)
 
     def stream_batch(self, cursor, table_name: str, batch_size: int = 10_000):
-        """
-        Full-sync streaming: sequentially fetch rows without OFFSET.
-        Works best for reloads (truncate + reload). Not suitable for resume.
-        """
-        try:
-            cursor.execute(f"SELECT * FROM {self._qualify(table_name)}")
-
+        """Stream on owned or borrowed handles; reconnect only before yielding rows."""
+        qualified_table = self._qualify(table_name)
+        def _stream(active_cursor):
+            active_cursor.execute(f"SELECT * FROM {qualified_table}")
             while True:
-                rows = cursor.fetchmany(batch_size)
+                rows = active_cursor.fetchmany(batch_size)
                 if not rows:
-                    break
+                    return
                 yield rows
-        except Exception as exc:
-            logger.error(f"Error streaming batch from {table_name}: {exc}")
-            return
+
+        yield from self._iterate_read_with_retry("stream_batch", _stream, cursor=cursor)
 
     def get_connection_schemas(self) -> List[str]:
         """
@@ -187,31 +174,19 @@ class Db2iConnector(SqlConnector):
         (the Q* / SYS* collections). The configured library is reordered to the front
         by the API layer.
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        try:
+        def _read(cursor):
             cursor.execute(
                 "SELECT SCHEMA_NAME FROM QSYS2.SYSSCHEMAS "
                 "WHERE SCHEMA_NAME NOT LIKE 'Q%' AND SCHEMA_NAME NOT LIKE 'SYS%' "
                 "ORDER BY SCHEMA_NAME"
             )
             return [row[0].strip() for row in cursor.fetchall() if row[0]]
-        except Exception as e:
-            logger.error(f"Error getting schemas: {e}")
-            # Fall back to the configured library so the UI still has one option.
-            lib = self._lib()
-            return [lib] if lib else []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_connection_schemas", _read)
 
     def get_connection_tables(self, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        lib = self._lib(schema)
-        try:
-            # TABLE_TYPE: 'T' = SQL table, 'P' = (DDS) physical file. Most IBM i data
-            # lives in physical files, so both must be included or the list is empty.
+        def _read(cursor):
+            lib = self._lib(schema)
             if lib:
                 cursor.execute(
                     "SELECT TABLE_NAME FROM QSYS2.SYSTABLES "
@@ -227,17 +202,11 @@ class Db2iConnector(SqlConnector):
                 )
             tables = [row[0].strip() for row in cursor.fetchall()]
             return tables
-        except Exception as e:
-            logger.error(f"Error getting tables: {e}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_connection_tables", _read)
 
     def get_connection_columns(self, table_name, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        try:
+        def _read(cursor):
             lib, pure_table = self._split_schema_table(table_name, schema)
             sql = (
                 "SELECT COLUMN_NAME, DATA_TYPE FROM QSYS2.SYSCOLUMNS "
@@ -248,7 +217,6 @@ class Db2iConnector(SqlConnector):
                 sql += " AND TABLE_SCHEMA = ?"
                 params.append(lib)
             sql += " ORDER BY ORDINAL_POSITION"
-
             cursor.execute(sql, params)
             rows = cursor.fetchall()
             columns = [
@@ -261,34 +229,22 @@ class Db2iConnector(SqlConnector):
                 for row in rows
             ]
             return columns
-        except Exception as e:
-            logger.error(f"Error getting columns: {e}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_connection_columns", _read)
 
     def count_table_rows(self, table_name: str) -> int:
-        connection = self.get_connection()
-        cursor = connection.cursor()
-        try:
+        def _read(cursor):
             cursor.execute(f"SELECT COUNT(*) FROM {self._qualify(table_name)}")
             count_result = cursor.fetchone()
             return int(count_result[0]) if count_result else 0
-        except Exception as e:
-            logger.error(f"Error getting table total rows: {str(e)}")
-            return 0
-        finally:
-            cursor.close()
-            connection.close()
+
+        return self._run_read_with_retry("count_table_rows", _read)
 
     def get_min_max_date(self, table_name: str, column_name: str):
         """
         Returns (min_value, max_value) for a DATE/TIMESTAMP column in Db2 for i.
         """
-        conn = self.get_connection()
-        cur = conn.cursor()
-        try:
+        def _read(cur):
             sql = (
                 f'SELECT MIN("{column_name}") AS min_val, MAX("{column_name}") AS max_val '
                 f"FROM {self._qualify(table_name)} "
@@ -297,15 +253,12 @@ class Db2iConnector(SqlConnector):
             cur.execute(sql)
             row = cur.fetchone()
             return (row[0], row[1]) if row else (None, None)
-        finally:
-            cur.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_min_max_date", _read)
 
     def extract_table_schema(self, table_name, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        lib, pure_table = self._split_schema_table(table_name, schema)
-        try:
+        def _read(cursor):
+            lib, pure_table = self._split_schema_table(table_name, schema)
             schema_filter = "AND c.TABLE_SCHEMA = ?" if lib else ""
             sql = f"""
                 SELECT
@@ -355,10 +308,8 @@ class Db2iConnector(SqlConnector):
             params = [pure_table]
             if lib:
                 params.append(lib)
-
             cursor.execute(sql, params)
             rows = cursor.fetchall()
-
             columns = [
                 {
                     "position": col[0],
@@ -374,12 +325,8 @@ class Db2iConnector(SqlConnector):
                 for col in rows
             ]
             return columns
-        except Exception as e:
-            logger.error(f"Error getting database schema: {str(e)}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("extract_table_schema", _read)
 
     def fetch_deltas(
         self,
@@ -390,38 +337,39 @@ class Db2iConnector(SqlConnector):
         batch_size: int = 10_000,
     ):
         # Keep only the latest log row per primary key, like the SQL Server connector.
-        partition_expr = ", ".join(primary_keys)
-        order_by_final = ", ".join(primary_keys)
+        def _stream(cursor):
+            partition_expr = ", ".join(primary_keys)
+            order_by_final = ", ".join(primary_keys)
+            sql = f"""
+                SELECT *
+                FROM (
+                    SELECT t.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY {partition_expr}
+                            ORDER BY Date_operation DESC
+                        ) AS rn
+                    FROM {self._qualify(log_table)} t
+                    WHERE Date_operation > ?
+                ) AS ranked
+                WHERE rn = 1
+                ORDER BY {order_by_final}
+                OFFSET ? ROWS
+                FETCH FIRST ? ROWS ONLY
+            """
+            offset = 0
+            while True:
+                cursor.execute(sql, [since_ts, offset, batch_size])
+                rows = cursor.fetchall()
+                if not rows:
+                    break
 
-        sql = f"""
-            SELECT *
-            FROM (
-                SELECT t.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY {partition_expr}
-                        ORDER BY Date_operation DESC
-                    ) AS rn
-                FROM {self._qualify(log_table)} t
-                WHERE Date_operation > ?
-            ) AS ranked
-            WHERE rn = 1
-            ORDER BY {order_by_final}
-            OFFSET ? ROWS
-            FETCH FIRST ? ROWS ONLY
-        """
+                col_names = [col[0] for col in cursor.description]
+                for row in rows:
+                    yield dict(zip(col_names, row))
 
-        offset = 0
-        while True:
-            cursor.execute(sql, [since_ts, offset, batch_size])
-            rows = cursor.fetchall()
-            if not rows:
-                break
+                offset += batch_size
 
-            col_names = [col[0] for col in cursor.description]
-            for row in rows:
-                yield dict(zip(col_names, row))
-
-            offset += batch_size
+        yield from self._iterate_read_with_retry("fetch_deltas", _stream, cursor=cursor)
 
     def truncate_table(self, table_name: str) -> bool:
         """Remove all data from the table while keeping its structure."""
@@ -448,22 +396,15 @@ class Db2iConnector(SqlConnector):
         Accepts "table" or "schema.table". Unique/primary-key constraints come from
         SYSCST + SYSKEYCST; plain indexes come from SYSINDEXES + SYSKEYS.
         """
-
         def _split_schema_table(t: str) -> Tuple[str, str]:
             t = (t or "").strip().replace('"', "")
             if "." in t:
                 s, tb = t.split(".", 1)
                 return s.strip().upper(), tb.strip()
             return self._lib(), t.strip()
-
         schema_name, pure_table = _split_schema_table(table_name)
-
-        conn = self.get_connection()
-        cur = conn.cursor()
-        try:
+        def _read(cur):
             results: List[Dict[str, Any]] = []
-
-            # 1) Unique / primary key constraints
             cst_sql = """
                 SELECT t.CONSTRAINT_NAME, t.CONSTRAINT_TYPE, k.COLUMN_NAME, k.ORDINAL_POSITION
                 FROM QSYS2.SYSCST t
@@ -478,7 +419,6 @@ class Db2iConnector(SqlConnector):
                 cst_sql += " AND t.TABLE_SCHEMA = ?"
                 params.append(schema_name)
             cst_sql += " ORDER BY t.CONSTRAINT_NAME, k.ORDINAL_POSITION"
-
             cur.execute(cst_sql, params)
             cst_map: Dict[str, Dict[str, Any]] = {}
             for r in cur.fetchall():
@@ -497,8 +437,6 @@ class Db2iConnector(SqlConnector):
                 if col:
                     entry["columns"].append(col)
             results.extend(v for v in cst_map.values() if v["columns"])
-
-            # 2) Plain (non-constraint) indexes
             idx_sql = """
                 SELECT i.INDEX_NAME, i.IS_UNIQUE, k.COLUMN_NAME, k.ORDINAL_POSITION
                 FROM QSYS2.SYSINDEXES i
@@ -512,7 +450,6 @@ class Db2iConnector(SqlConnector):
                 idx_sql += " AND i.TABLE_SCHEMA = ?"
                 params.append(schema_name)
             idx_sql += " ORDER BY i.INDEX_NAME, k.ORDINAL_POSITION"
-
             cur.execute(idx_sql, params)
             idx_map: Dict[str, Dict[str, Any]] = {}
             for r in cur.fetchall():
@@ -528,13 +465,6 @@ class Db2iConnector(SqlConnector):
                 if col:
                     entry["columns"].append(col)
             results.extend(v for v in idx_map.values() if v["columns"])
-
             return results
-        except Exception as e:
-            logger.error(
-                f"Error getting indexes for Db2 for i table {schema_name}.{pure_table}: {e}"
-            )
-            return []
-        finally:
-            cur.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_table_indexes", _read)

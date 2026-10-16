@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pyodbc import Cursor
 
 from .sql_connector import SqlConnector
+from .connection_errors import postgres_connection_error
 from ddp_connectors.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
     _build_having_clause
 from ddp_connectors.database_connectors.sql_connector_utils import cast_postgres_to_typescript, normalize_ui_column_type
@@ -16,6 +17,9 @@ from .sql_connector_utils import safe_convert_to_string
 
 
 class PostgresConnector(SqlConnector):
+
+    supports_owned_read_cursor = True
+    _is_retryable_connection_error = staticmethod(postgres_connection_error)
 
     def __init__(self, host, user, password, port, database, schema):
         super().__init__(host, user, password, port, database)
@@ -35,6 +39,9 @@ class PostgresConnector(SqlConnector):
         return ",".join(search_path_parts)
     
     def get_connection(self):
+        return self._connect_with_retry()
+
+    def _open_connection(self):
         conn_params = {
             "host": self.host,
             "user": self.user,
@@ -121,6 +128,7 @@ class PostgresConnector(SqlConnector):
                 f"[postgres][discovery_debug] database={self.database} user={self.user} label={label} "
                 f"failed: {debug_exc}"
             )
+            raise
 
     def _log_schema_discovery_debug_snapshot(self, cur) -> None:
         self._log_debug_query(
@@ -338,11 +346,7 @@ class PostgresConnector(SqlConnector):
         )
 
     def get_connection_schemas(self) -> List[str]:
-        conn = None
-        cur = None
-        try:
-            conn = self.get_connection()
-            cur = conn.cursor()
+        def _read(cur):
             logger.info(
                 f"[postgres][schema_discovery] database={self.database} query_path=pg_namespace exclude_system=true"
             )
@@ -362,18 +366,8 @@ class PostgresConnector(SqlConnector):
             if not schemas:
                 self._log_schema_discovery_debug_snapshot(cur)
             return schemas
-        except Exception as exc:
-            self._log_metadata_failure(
-                operation="schema_discovery",
-                query_path="pg_namespace",
-                exc=exc,
-            )
-            raise
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
+
+        return self._run_read_with_retry("get_connection_schemas", _read)
 
     def _build_filters_clause(self, filters) -> Tuple[str, List[Any]]:
         """Parse filters payload into a safe WHERE clause and parameters."""
@@ -525,90 +519,50 @@ class PostgresConnector(SqlConnector):
             f"OFFSET {offset} LIMIT {limit};"
         )
         logger.info(f"Fetching batch: table={qualified_table}, offset={offset}, limit={limit}, filters_applied={bool(where_clause.strip())}")
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        try:
+        def _read(cursor):
             cursor.execute(query, params)
             cols = [c[0] for c in cursor.description]
             return [
                 {col: safe_convert_to_string(row[idx]) for idx, col in enumerate(cols)}
                 for row in cursor.fetchall()
             ]
-        except Exception as exc:
-            logger.error(f"Error extracting batch from {table_name}: {exc}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+
+        return self._run_read_with_retry("extract_data_batch", _read)
 
     def fetch_batch(self, cursor: Cursor, table_name, offset: int, batch_size: int = 100, schema: Optional[str] = None, **kwargs):
-        try:
+        def _read(cursor):
             limit = kwargs.get("limit", batch_size)
             qualified_table = self._qualify_table_sql(table_name, schema)
             query = f"SELECT * FROM {qualified_table} OFFSET {offset} LIMIT {limit}"
             cursor.execute(query)
             results = cursor.fetchall()
             return results
-        except Exception as e:
-            logger.error(f"Error fetching batch from {table_name}: {str(e)}")
-            return []
+
+        return self._run_read_with_retry("fetch_batch", _read, cursor=cursor)
 
     def stream_batch(self, cursor=None, table_name: Optional[str] = None, batch_size: int = 10_000, schema: Optional[str] = None):
-        """
-        Full-sync streaming for Postgres using a server-side cursor.
-        Avoids OFFSET and prevents loading the full result set into memory.
-        """
-        conn = None
-        managed_cursor = None
+        """Stream on owned or borrowed handles; reconnect only before yielding rows."""
         if table_name is None and isinstance(cursor, str):
-            table_name = cursor
-            cursor = None
-
+            table_name, cursor = cursor, None
         if not table_name:
             raise ValueError("table_name is required")
-
-        cursor_name = f"stream_{table_name.replace('.', '_')}"
         qualified_table = self._qualify_table_sql(table_name, schema)
         select_clause = self._build_stream_select_clause(table_name, schema)
-
-        try:
-            if cursor is None:
-                conn = self.get_connection()
-                # IMPORTANT: server-side cursors require an open transaction
-                managed_cursor = conn.cursor(name=cursor_name)
-            else:
-                managed_cursor = cursor
-
-            managed_cursor.itersize = batch_size
-
-            logger.info(f"Start streaming Postgres table {qualified_table} with batch_size={batch_size}")
-            managed_cursor.execute(f"SELECT {select_clause} FROM {qualified_table}")
-
+        cursor_name = f"stream_{table_name.replace('.', '_')}"
+        def _stream(active_cursor):
+            active_cursor.itersize = batch_size
+            active_cursor.execute(f"SELECT {select_clause} FROM {qualified_table}")
             while True:
-                rows = managed_cursor.fetchmany(batch_size)
+                rows = active_cursor.fetchmany(batch_size)
                 if not rows:
-                    break
+                    return
                 yield rows
 
-            logger.info(f"Finished streaming Postgres table {qualified_table}")
-
-        except Exception as exc:
-            logger.error(f"Error streaming batch from Postgres table {table_name}: {exc}")
-            raise
-
-        finally:
-            if managed_cursor and conn:
-                managed_cursor.close()
-            if conn:
-                conn.close()
+        yield from self._iterate_read_with_retry("stream_batch", _stream, cursor=cursor, cursor_factory=lambda conn: conn.cursor(name=cursor_name))
 
     def get_connection_tables(self, schema: Optional[str] = None):
         target_schema = self._normalize_identifier(schema) or self.schema
-        conn = None
-        cur = None
-        try:
-            conn = self.get_connection()
-            cur = conn.cursor()
+        def _read(cur):
             logger.info(
                 f"[postgres][table_discovery] database={self.database} selected_schema={target_schema} query_path=information_schema.tables"
             )
@@ -629,27 +583,12 @@ class PostgresConnector(SqlConnector):
             if not tables:
                 self._log_table_discovery_debug_snapshot(cur, target_schema)
             return tables
-        except Exception as exc:
-            self._log_metadata_failure(
-                operation="table_discovery",
-                query_path="information_schema.tables",
-                exc=exc,
-                schema=target_schema,
-            )
-            raise
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
+
+        return self._run_read_with_retry("get_connection_tables", _read)
 
     def get_connection_columns(self, table_name: str, schema: Optional[str] = None):
         target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        conn = None
-        cur = None
-        try:
-            conn = self.get_connection()
-            cur = conn.cursor()
+        def _read(cur):
             logger.info(
                 f"[postgres][column_discovery] database={self.database} selected_schema={target_schema} selected_table={pure_table} query_path=information_schema.columns"
             )
@@ -673,7 +612,6 @@ class PostgresConnector(SqlConnector):
             )
             if not rows:
                 self._log_column_discovery_debug_snapshot(cur, target_schema, pure_table)
-
             columns: List[Dict[str, str]] = []
             for column_name, data_type, udt_name in rows:
                 type_source = udt_name if data_type == "USER-DEFINED" else data_type
@@ -685,50 +623,29 @@ class PostgresConnector(SqlConnector):
                     "classification": "",
                 })
             return columns
-        except Exception as exc:
-            self._log_metadata_failure(
-                operation="column_discovery",
-                query_path="information_schema.columns",
-                exc=exc,
-                schema=target_schema,
-                table=pure_table,
-            )
-            raise
-        finally:
-            if cur:
-                cur.close()
-            if conn:
-                conn.close()
+
+        return self._run_read_with_retry("get_connection_columns", _read)
 
 
     def count_table_rows(self, table_name: str, schema: Optional[str] = None, filters=None) -> int:
         schema, filters = self.coerce_schema_and_filters(schema, filters)
         where_clause, params = self._build_filters_clause(filters)
         qualified_table = self._qualify_table_sql(table_name, schema)
-        connection = self.get_connection()
-        cursor = connection.cursor()
-        try:
+        def _read(cursor):
             cursor.execute(f"SELECT COUNT(*) FROM {qualified_table}{where_clause}", params)
             count_result = cursor.fetchone()
             total_count = int(count_result[0]) if count_result else 0
             return total_count
-        except Exception as e:
-            logger.error(f"Error getting table total rows: {str(e)}")
-            return 0
-        finally:
-            cursor.close()
-            connection.close()
+
+        return self._run_read_with_retry("count_table_rows", _read)
 
     def get_min_max_date(self, table_name: str, column_name: str, schema: Optional[str] = None):
         """
         Returns (min_value, max_value) for a DATE/TIMESTAMP column in a Postgres table.
         Assumes table_name / column_name are valid identifiers (same assumption as other methods).
         """
-
-        conn = self.get_connection()
-        cur = conn.cursor()
-        qualified_table = self._qualify_table_sql(table_name, schema)
-        try:
+        def _read(cur):
+            qualified_table = self._qualify_table_sql(table_name, schema)
             quoted_column = self._quote_identifier(column_name, preserve_exact=True)
             sql = (
                 f"SELECT MIN({quoted_column}), MAX({quoted_column}) "
@@ -738,15 +655,12 @@ class PostgresConnector(SqlConnector):
             cur.execute(sql)
             row = cur.fetchone()
             return (row[0], row[1]) if row else (None, None)
-        finally:
-            cur.close()
-            conn.close()
+
+        return self._run_read_with_retry("get_min_max_date", _read)
 
     def extract_table_schema(self, table_name, schema: Optional[str] = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        try:
+        def _read(cursor):
+            target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
             schema_sql = """
                       SELECT
                         a.attnum AS position,
@@ -799,10 +713,8 @@ class PostgresConnector(SqlConnector):
                       AND NOT a.attisdropped
                     ORDER BY a.attnum;
                 """
-
             cursor.execute(schema_sql, (target_schema, pure_table))
             rows = cursor.fetchall()
-
             result = [
                 {
                     "position": row[0],
@@ -817,15 +729,9 @@ class PostgresConnector(SqlConnector):
                 }
                 for row in rows
             ]
-
             return result
 
-        except Exception as exc:
-            logger.error(f"Error extracting schema for {table_name}: {exc}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+        return self._run_read_with_retry("extract_table_schema", _read)
 
 
     def create_schema_if_missing(self, schema_name: str):
@@ -1287,9 +1193,7 @@ class PostgresConnector(SqlConnector):
                table_name: The name of the table to get columns for
                schema: Schema name, defaults to "populations"
         """
-        conn = self.get_connection()
-        cur = conn.cursor()
-        try:
+        def _read(cur):
             cur.execute(
                 """
                     SELECT
@@ -1309,48 +1213,43 @@ class PostgresConnector(SqlConnector):
                 (schema_name, table_name),
             )
             rows = cur.fetchall()
-
             columns: list[dict[str, str]] = []
             for column_name, data_type in rows:
                 ts_type = cast_postgres_to_typescript(data_type)
                 columns.append({"name": column_name, "type": ts_type})
             return columns
-        except Exception as e:
-            logger.error(f"Error getting view columns: {e}")
-            return []
 
-        finally:
-            cur.close()
-            conn.close()
+        return self._run_read_with_retry("get_view_columns", _read)
 
     def fetch_deltas(self, cursor, primary_keys, log_table: str, since_ts: datetime, batch_size: int = 10_000, schema: Optional[str] = None):
-        normalized_primary_keys = self.normalize_primary_keys(primary_keys)
-        qualified_log_table = self._qualify_table_sql(log_table, schema)
-        if not normalized_primary_keys:
-            logger.error("fetch_deltas requires at least one primary key column.")
-            return
+        def _stream(cursor):
+            normalized_primary_keys = self.normalize_primary_keys(primary_keys)
+            qualified_log_table = self._qualify_table_sql(log_table, schema)
+            if not normalized_primary_keys:
+                raise ValueError("fetch_deltas requires at least one primary key column.")
+            primary_key_sql = ", ".join(self._quote_identifier(pk) for pk in normalized_primary_keys)
+            sql = f"""
+                SELECT DISTINCT ON ({primary_key_sql}) *
+                FROM {qualified_log_table}
+                WHERE Date_operation > %s
+                ORDER BY {primary_key_sql},
+                Date_operation DESC
+                LIMIT %s OFFSET %s;
+            """
+            offset = 0
+            while True:
+                cursor.execute(sql, (since_ts, batch_size, offset))
+                rows = cursor.fetchall()
+                if not rows:
+                    break
 
-        primary_key_sql = ", ".join(self._quote_identifier(pk) for pk in normalized_primary_keys)
-        sql = f"""
-            SELECT DISTINCT ON ({primary_key_sql}) *
-            FROM {qualified_log_table}
-            WHERE Date_operation > %s
-            ORDER BY {primary_key_sql}, 
-            Date_operation DESC
-            LIMIT %s OFFSET %s;
-        """
-        offset = 0
-        while True:
-            cursor.execute(sql, (since_ts, batch_size, offset))
-            rows = cursor.fetchall()
-            if not rows:
-                break
+                col_names = [desc[0] for desc in cursor.description]
+                for row in rows:
+                    yield dict(zip(col_names, row))
 
-            col_names = [desc[0] for desc in cursor.description]
-            for row in rows:
-                yield dict(zip(col_names, row))
+                offset += batch_size
 
-            offset += batch_size
+        yield from self._iterate_read_with_retry("fetch_deltas", _stream, cursor=cursor)
 
 
     def build_query(self, data: Dict[str, Any], invert_where: bool = False):
@@ -1730,10 +1629,8 @@ class PostgresConnector(SqlConnector):
         {"name": "pk_schema_agent", "unique": True, "primary": True, "columns": ["numaffil"]}
         ]
         """
-        conn = self.get_connection()
-        cur = conn.cursor()
-        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        try:
+        def _read(cur):
+            target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
             sql = """
             SELECT
             i.relname AS index_name,
@@ -1753,7 +1650,6 @@ class PostgresConnector(SqlConnector):
             """
             cur.execute(sql, (target_schema, pure_table))
             rows = cur.fetchall()
-
             results: List[Dict[str, Any]] = []
             for index_name, is_unique, is_primary, cols in rows:
                 if not cols:
@@ -1768,12 +1664,7 @@ class PostgresConnector(SqlConnector):
                 )
             return results
 
-        except Exception as e:
-            logger.error(f"Error getting indexes for Postgres table {self.qualify_table_name(table_name, schema)}: {e}")
-            return []
-        finally:
-            cur.close()
-            conn.close()
+        return self._run_read_with_retry("get_table_indexes", _read)
 
 
     def _build_stream_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
@@ -1783,18 +1674,15 @@ class PostgresConnector(SqlConnector):
         Risky Postgres date/time values are cast to text so psycopg2 does not
         attempt to coerce out-of-range values into Python datetime objects.
         """
-        conn = self.get_connection()
-        cur = conn.cursor()
-        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        risky_types = {
-            "date",
-            "timestamp without time zone",
-            "timestamp with time zone",
-            "time without time zone",
-            "time with time zone",
-        }
-
-        try:
+        def _read(cur):
+            target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+            risky_types = {
+                "date",
+                "timestamp without time zone",
+                "timestamp with time zone",
+                "time without time zone",
+                "time with time zone",
+            }
             cur.execute(
                 """
                 SELECT
@@ -1808,21 +1696,16 @@ class PostgresConnector(SqlConnector):
                 """,
                 (target_schema, pure_table),
             )
-
             select_parts = []
-
             for column_name, data_type, _udt_name in cur.fetchall():
                 quoted_col = self._quote_identifier(column_name, preserve_exact=True)
                 if data_type in risky_types:
                     select_parts.append(f"{quoted_col}::text AS {quoted_col}")
                 else:
                     select_parts.append(quoted_col)
-
             return ", ".join(select_parts) if select_parts else "*"
 
-        finally:
-            cur.close()
-            conn.close()
+        return self._run_read_with_retry("_build_stream_select_clause", _read)
 
     def _build_display_select_clause(self, table_name: str, schema: Optional[str] = None) -> str:
         """
@@ -1832,18 +1715,15 @@ class PostgresConnector(SqlConnector):
         Example:
             geometry(Point,4326) -> POINT(-7.5898 33.5731)
         """
-        conn = self.get_connection()
-        cur = conn.cursor()
-        target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
-        DATE_TIME_TYPES = {
-            "date",
-            "timestamp without time zone",
-            "timestamp with time zone",
-            "time without time zone",
-            "time with time zone",
-        }
-
-        try:
+        def _read(cur):
+            target_schema, pure_table = self.resolve_schema_and_table(table_name, schema)
+            DATE_TIME_TYPES = {
+                "date",
+                "timestamp without time zone",
+                "timestamp with time zone",
+                "time without time zone",
+                "time with time zone",
+            }
             cur.execute(
                 """
                 SELECT
@@ -1858,9 +1738,7 @@ class PostgresConnector(SqlConnector):
                 """,
                 (target_schema, pure_table),
             )
-
             select_parts = []
-
             for column_name, data_type, udt_schema, udt_name in cur.fetchall():
                 quoted_col = self._quote_identifier(column_name, preserve_exact=True)
                 if data_type == "USER-DEFINED" and udt_name in ("geometry", "geography"):
@@ -1872,9 +1750,6 @@ class PostgresConnector(SqlConnector):
                     select_parts.append(f"{quoted_col}::text AS {quoted_col}")
                 else:
                     select_parts.append(quoted_col)
-
             return ", ".join(select_parts) if select_parts else "*"
 
-        finally:
-            cur.close()
-            conn.close()
+        return self._run_read_with_retry("_build_display_select_clause", _read)
