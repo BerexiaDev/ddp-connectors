@@ -360,32 +360,33 @@ class OracleConnector(SqlConnector):
         schema_name = (target_schema or self.schema).upper()
         try:
             with conn.cursor() as cursor:
+                # EXISTS rather than JOIN: a column in several indexes/constraints must still yield one row
                 schema_sql = """
-                    SELECT 
+                    SELECT
                         c.column_id AS position,
                         c.column_name AS name,
                         c.data_type,
                         c.data_length AS max_length,
                         CASE WHEN c.nullable = 'N' THEN 'NO' ELSE 'YES' END AS is_nullable,
                         c.data_default AS default_value,
-                        CASE WHEN pk.column_name IS NOT NULL THEN 'YES' ELSE 'NO' END AS is_primary_key,
-                        CASE WHEN fk.column_name IS NOT NULL THEN 'YES' ELSE 'NO' END AS is_foreign_key,
-                        CASE WHEN idx.column_name IS NOT NULL THEN 'YES' ELSE 'NO' END AS is_index
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM all_constraints con
+                            JOIN all_cons_columns cc ON cc.owner = con.owner AND cc.constraint_name = con.constraint_name
+                            WHERE con.owner = c.owner AND con.table_name = c.table_name
+                              AND con.constraint_type = 'P' AND cc.column_name = c.column_name
+                        ) THEN 'YES' ELSE 'NO' END AS is_primary_key,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM all_constraints con
+                            JOIN all_cons_columns cc ON cc.owner = con.owner AND cc.constraint_name = con.constraint_name
+                            WHERE con.owner = c.owner AND con.table_name = c.table_name
+                              AND con.constraint_type = 'R' AND cc.column_name = c.column_name
+                        ) THEN 'YES' ELSE 'NO' END AS is_foreign_key,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM all_ind_columns ic
+                            WHERE ic.table_owner = c.owner AND ic.table_name = c.table_name
+                              AND ic.column_name = c.column_name
+                        ) THEN 'YES' ELSE 'NO' END AS is_index
                     FROM all_tab_columns c
-                    LEFT JOIN (
-                        SELECT cc.column_name FROM all_constraints con 
-                        JOIN all_cons_columns cc ON con.constraint_name = cc.constraint_name 
-                        WHERE con.table_name = :table_name AND con.owner = :schema_name AND con.constraint_type = 'P'
-                    ) pk ON c.column_name = pk.column_name
-                    LEFT JOIN (
-                        SELECT cc.column_name FROM all_constraints con 
-                        JOIN all_cons_columns cc ON con.constraint_name = cc.constraint_name 
-                        WHERE con.table_name = :table_name AND con.owner = :schema_name AND con.constraint_type = 'R'
-                    ) fk ON c.column_name = fk.column_name
-                    LEFT JOIN (
-                        SELECT column_name FROM all_ind_columns 
-                        WHERE table_name = :table_name AND index_owner = :schema_name
-                    ) idx ON c.column_name = idx.column_name
                     WHERE c.owner = :schema_name AND c.table_name = :table_name
                     ORDER BY c.column_id
                 """
