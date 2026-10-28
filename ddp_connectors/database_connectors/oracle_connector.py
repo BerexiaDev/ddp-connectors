@@ -22,6 +22,7 @@ class OracleConnector(SqlConnector):
         Returns True if successful, raises an Exception or returns False if not.
         """
         conn = None
+        self.last_error = None
         try:
             # 1. This tests if the Host, Port, Database, User, and Password are correct.
             # If get_connection() fails, it throws an exception immediately.
@@ -40,6 +41,7 @@ class OracleConnector(SqlConnector):
                 
                 if schema_count == 0:
                     logger.error(f"Ping failed: Schema '{self.schema}' does not exist.")
+                    self.last_error = f"Schema '{self.schema}' does not exist, or this user cannot see it."
                     return False
                     
             logger.info(f"Successfully pinged Oracle database and verified schema: {self.schema}")
@@ -47,6 +49,7 @@ class OracleConnector(SqlConnector):
             
         except Exception as exc:
             logger.error(f"Oracle connection ping failed: {exc}")
+            self.last_error = self.describe_error(exc)
             return False
             
         finally:

@@ -1,5 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+import codecs
+import re
 from datetime import datetime
 from typing import Any, List, Dict, Optional
 import pyodbc
@@ -10,7 +12,54 @@ from .sql_connector import SqlConnector
 from .sql_connector_utils import cast_informix_to_typescript_types, cast_informix_to_postgresql_type, safe_convert_to_string, normalize_ui_column_type
 
 
+# The DataDirect driver ships without its message files, so it reports bare numbers.
+# 6015 is raised by the driver before reaching the server: it is the same for a wrong
+# host, port, database, user or password, or an unreachable server.
+DATADIRECT_MESSAGES = {
+    "6015": "Could not connect to the Informix server. Check the host, port, database name, "
+            "user and password, and that the Informix port is reachable from the platform (firewall).",
+}
+INFORMIX_ERRORS = {
+    "-201": "SQL syntax error",
+    "-206": "table not found",
+    "-329": "database not found, or no permission to open it",
+    "-387": "no connect permission on this database",
+    "-951": "incorrect password, or user not known on the database server",
+}
+
+
+# The driver returns text in the database's code set: decode it from the connector's
+# locale (e.g. en_US.utf8, ar_ma.8859-6, en_US.819).
+LOCALE_CODECS = {
+    "819": "latin-1", "8859-1": "latin-1", "1252": "cp1252",
+    "8859-6": "iso8859_6", "1256": "cp1256",
+}
+UTF8_OR_LATIN1 = "ddp_utf8_or_latin1"
+
+
+def _decode_utf8_or_latin1(data, errors="strict"):
+    """UTF-8, or Latin-1 for a value that is not valid UTF-8 (data stored in a Latin-1 database)."""
+    data = bytes(data)
+    try:
+        return data.decode("utf-8"), len(data)
+    except UnicodeDecodeError:
+        return data.decode("latin-1"), len(data)
+
+
+codecs.register(lambda name: codecs.CodecInfo(name=UTF8_OR_LATIN1, encode=codecs.utf_8_encode,
+                                              decode=_decode_utf8_or_latin1) if name == UTF8_OR_LATIN1 else None)
+
+
+def text_encoding(locale):
+    """Python codec for the text of a database with this Informix locale."""
+    code_set = (locale or "").rsplit(".", 1)[-1].strip().lower()
+    return LOCALE_CODECS.get(code_set, UTF8_OR_LATIN1)
+
+
 class InformixConnector(SqlConnector):
+
+    # Informix has no bare SELECT 1 (error -201): systables always has tabid 1.
+    PING_QUERY = "SELECT 1 FROM systables WHERE tabid = 1"
 
     def __init__(self, host, user, password, port, database, protocol, locale):
         super().__init__(host, user, password, port, database)
@@ -18,6 +67,17 @@ class InformixConnector(SqlConnector):
         self.locale = locale
         self.driver_path = "app/main/drivers/ddifcl28.so"
         self.schema = user
+
+    def describe_error(self, error: Exception) -> str:
+        text = super().describe_error(error)
+        driver_code = re.search(r"\](\d+) \(", text)
+        if driver_code and driver_code.group(1) in DATADIRECT_MESSAGES:
+            return f"{DATADIRECT_MESSAGES[driver_code.group(1)]} (driver message {driver_code.group(1)})"
+        native = re.search(r"\((-\d+)\)", text)
+        if native:
+            meaning = INFORMIX_ERRORS.get(native.group(1))
+            return f"Informix error {native.group(1)}" + (f": {meaning}" if meaning else "") + f" ({text})"
+        return text
 
     def construct_query(self, query, preview, rows):
         if preview:
@@ -41,8 +101,7 @@ class InformixConnector(SqlConnector):
             "LoginTimeout=10;"
         )
         conn = pyodbc.connect(conn_str, timeout=10)
-        # Set decoding to ISO-8859-1 (en_US.819) for both SQL_CHAR and SQL_WCHAR
-        conn.setdecoding(pyodbc.SQL_CHAR, encoding='latin1')  # ISO-8859-1 = Latin-1
+        conn.setdecoding(pyodbc.SQL_CHAR, encoding=text_encoding(self.locale))
         conn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')  # In case of wide chars
         return conn
 

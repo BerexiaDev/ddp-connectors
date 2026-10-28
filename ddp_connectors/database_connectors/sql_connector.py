@@ -10,6 +10,9 @@ from loguru import logger
 
 class SqlConnector():
 
+    # Query run by ping(); engines that need a FROM clause override it.
+    PING_QUERY = "SELECT 1"
+
     def __init__(self, host, user, password, port, database):
         self.host = host
         self.user = user
@@ -17,6 +20,8 @@ class SqlConnector():
         self.port = port
         self.database = database
         self.driver = None
+        # Readable cause of the last failed ping, for the caller to show.
+        self.last_error = None
 
     
     @abstractmethod
@@ -28,14 +33,16 @@ class SqlConnector():
         """Returns True if the connection is successful, False otherwise."""
         conn = None
         cursor = None
+        self.last_error = None
 
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT 1")
+            cursor.execute(self.PING_QUERY)
             cursor.fetchone()  # ensure the query actually ran
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
+            self.last_error = self.describe_error(e)
             return False
         finally:
             if cursor:
@@ -45,6 +52,11 @@ class SqlConnector():
 
         logger.info("Database connection is active.")
         return True
+
+    def describe_error(self, error: Exception) -> str:
+        """A driver error as a message for the user."""
+        args = getattr(error, "args", ())
+        return str(args[-1]) if args else str(error)
 
     def get_default_schema(self) -> Optional[str]:
         """Return the connector-level default schema when one exists."""
