@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+- Add bounded connection retries with configurable backoff across database
+  connectors, using driver-specific checks for temporary connection failures.
+- Retry safe reads on owned connections and stop retrying streamed reads after
+  the first result; preserve caller-owned cursors and their session state.
+- Restrict parameter-binding fallbacks to known unsupported driver operations.
+- Validate retry settings in the connector factory before creating connectors.
+
 ## 0.2.0
 
 - Produce one composite primary key for partitioned PostgreSQL tables without

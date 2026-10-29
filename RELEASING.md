@@ -1,6 +1,6 @@
 # Release procedure
 
-The proposed release is **ddp-connectors 0.2.0**. Existing version tags must remain
+The proposed release is **ddp-connectors 0.2.1**. Existing version tags must remain
 unchanged. The import namespace remains `ddp_connectors`; Python package indexes
 normalize underscores and hyphens to the same distribution name.
 
@@ -12,9 +12,9 @@ normalize underscores and hyphens to the same distribution name.
 4. Build clean artifacts with `python -m build`, then run
    `python -m twine check --strict dist/*`. Keep wheel/sdist hashes and smoke logs
    with the release record.
-5. Release ddp-connectors 0.2.0 independently. It does not require a ddp-lib release,
+5. Release ddp-connectors 0.2.1 independently. It does not require a ddp-lib release,
    source checkout or package installation.
-6. Tag the reviewed commit `0.2.0` and publish artifacts through the team's
+6. Tag the reviewed commit `0.2.1` and publish artifacts through the team's
    existing package release channel. Do not move earlier tags or publish donor
    packages. No publication is automated by this change.
 7. KAN-8 updates consumer pins and runs service integration tests. Validate actual
