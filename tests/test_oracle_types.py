@@ -1,4 +1,5 @@
 """Oracle catalog type names must produce usable PostgreSQL declarations."""
+import sqlite3
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,32 @@ from ddp_connectors.database_connectors.sql_connector_utils import cast_oracle_t
 
 
 class OracleTypeTests(unittest.TestCase):
+    def test_catalog_query_returns_each_column_once_with_multiple_indexes(self):
+        # Run the actual catalog query against relational fixtures. SQLite
+        # supports this SELECT syntax, including the Oracle-style named binds.
+        connection = sqlite3.connect(":memory:")
+        connection.executescript("""
+            CREATE TABLE all_tab_columns (owner, table_name, column_id, column_name,
+                data_type, data_length, nullable, data_default);
+            CREATE TABLE all_constraints (owner, table_name, constraint_name, constraint_type);
+            CREATE TABLE all_cons_columns (owner, table_name, constraint_name, column_name);
+            CREATE TABLE all_ind_columns (index_owner, table_owner, table_name, column_name);
+            INSERT INTO all_tab_columns VALUES ('SOURCE','EVENTS',1,'ID','NUMBER',22,'N',NULL);
+            INSERT INTO all_tab_columns VALUES ('SOURCE','EVENTS',2,'AT','TIMESTAMP(6)',11,'Y',NULL);
+            INSERT INTO all_constraints VALUES ('SOURCE','EVENTS','PK_EVENTS','P');
+            INSERT INTO all_cons_columns VALUES ('SOURCE','EVENTS','PK_EVENTS','ID');
+            INSERT INTO all_cons_columns VALUES ('OTHER','EVENTS','PK_EVENTS','AT');
+            INSERT INTO all_ind_columns VALUES ('SOURCE','SOURCE','EVENTS','ID');
+            INSERT INTO all_ind_columns VALUES ('SOURCE','SOURCE','EVENTS','ID');
+            INSERT INTO all_ind_columns VALUES ('OTHER','OTHER','EVENTS','AT');
+        """)
+        oracle = OracleConnector("host", "user", "password", 1521, "db", "source")
+        with patch.object(oracle, "_open_connection", return_value=connection):
+            columns = oracle.extract_table_schema("events")
+        self.assertEqual([(c["name"], c["type"], c["primary_key"], c["is_index"])
+                          for c in columns], [("ID", "NUMERIC", "YES", "YES"),
+                                             ("AT", "TIMESTAMP", "NO", "NO")])
+
     def test_timestamp_precision_and_timezone_variants(self):
         for suffix, expected in [("", "TIMESTAMP"), (" WITH TIME ZONE", "TIMESTAMPTZ"),
                                  (" WITH LOCAL TIME ZONE", "TIMESTAMPTZ")]:

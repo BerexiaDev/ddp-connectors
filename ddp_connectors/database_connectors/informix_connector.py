@@ -11,8 +11,23 @@ from .sql_connector import SqlConnector, is_parameter_binding_unsupported
 from .sql_connector_utils import cast_informix_to_typescript_types, cast_informix_to_postgresql_type, safe_convert_to_string, normalize_ui_column_type
 
 
+# DataDirect can report numeric messages when its message files are absent.
+DATADIRECT_MESSAGES = {
+    "6015": "Could not connect to the Informix server. Check the host, port, database name, "
+            "user and password, and that the Informix port is reachable from the platform (firewall).",
+}
+INFORMIX_ERRORS = {
+    "-201": "SQL syntax error",
+    "-206": "table not found",
+    "-329": "database not found, or no permission to open it",
+    "-387": "no connect permission on this database",
+    "-951": "incorrect password, or user not known on the database server",
+}
+
+
 class InformixConnector(SqlConnector):
     supports_owned_read_cursor = True
+    PING_QUERY = "SELECT 1 FROM systables WHERE tabid = 1"
 
     def __init__(self, host, user, password, port, database, protocol, locale):
         super().__init__(host, user, password, port, database)
@@ -20,6 +35,17 @@ class InformixConnector(SqlConnector):
         self.locale = locale
         self.driver_path = "app/main/drivers/ddifcl28.so"
         self.schema = user
+
+    def describe_error(self, error: Exception) -> str:
+        text = super().describe_error(error)
+        driver_code = re.search(r"\](\d+) \(", text)
+        if driver_code and driver_code.group(1) in DATADIRECT_MESSAGES:
+            return f"{DATADIRECT_MESSAGES[driver_code.group(1)]} (driver message {driver_code.group(1)})"
+        native = re.search(r"\((-\d+)\)", text)
+        if native:
+            meaning = INFORMIX_ERRORS.get(native.group(1))
+            return f"Informix error {native.group(1)}" + (f": {meaning}" if meaning else "") + f" ({text})"
+        return text
 
     def construct_query(self, query, preview, rows):
         if preview:

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Integrate the Informix connection-test query and readable ping errors with
+  the shared retry/cleanup behavior, including Oracle missing-schema errors.
+- Retain main's Oracle schema discovery fix: columns in multiple indexes or
+  constraints appear once, with owner-scoped metadata.
+- Resolve the older Informix branch against the strict Latin-1/UTF-8 encoding
+  contract from 0.2.2; ambiguous locale guessing and its 0.1.3 packaging are
+  superseded. No existing release tag is changed.
+
 ## 0.2.2 — 2026-11-02
 
 - Recognize Oracle TIMESTAMP precision 0–9, including both timezone variants,

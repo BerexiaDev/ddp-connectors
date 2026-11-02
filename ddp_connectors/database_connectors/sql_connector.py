@@ -82,6 +82,9 @@ def is_parameter_binding_unsupported(error: Exception) -> bool:
 
 
 class SqlConnector(RetryPolicy):
+    # Engines that require a FROM clause override the connection-test query.
+    PING_QUERY = "SELECT 1"
+
     def __init__(self, host, user, password, port, database):
         self.host = host
         self.user = user
@@ -89,6 +92,7 @@ class SqlConnector(RetryPolicy):
         self.port = port
         self.database = database
         self.driver = None
+        self.last_error = None
 
     
     @abstractmethod
@@ -153,18 +157,25 @@ class SqlConnector(RetryPolicy):
 
     def ping(self):
         """Returns True if the connection is successful, False otherwise."""
+        self.last_error = None
         def _ping(cursor):
-            cursor.execute("SELECT 1")
+            cursor.execute(self.PING_QUERY)
             cursor.fetchone()
 
         try:
             self._run_read_with_retry("ping", _ping)
         except Exception as e:
             logger.error(f"Database connection failed: {e}")
+            self.last_error = self.describe_error(e)
             return False
 
         logger.info("Database connection is active.")
         return True
+
+    def describe_error(self, error: Exception) -> str:
+        """A driver error as a message for the caller."""
+        args = getattr(error, "args", ())
+        return str(args[-1]) if args else str(error)
 
     def get_default_schema(self) -> Optional[str]:
         """Return the connector-level default schema when one exists."""

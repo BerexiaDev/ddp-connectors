@@ -67,7 +67,7 @@ Each connector handles the dialect differences internally — pagination syntax,
 - **Driver:** pyodbc with Informix-specific driver path
 - **Pagination:** `SKIP...FIRST` syntax
 - **Locale Support:** Configurable CLIENT_LOCALE and DB_LOCALE
-- **Encoding:** Handles Latin-1 (ISO-8859-1) for SQL_CHAR and UTF-8 for SQL_WCHAR
+- **Encoding:** Uses the configured Latin-1 or UTF-8 locale for text binding and character results, with strict encoding errors
 - **Type Mapping:** Translates Informix integer-based column type codes to both TypeScript and PostgreSQL types
 
 ### Db2 for IBM i
