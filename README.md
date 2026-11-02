@@ -172,9 +172,31 @@ Each connector requires a settings dictionary with connection parameters:
 | `database`  | Required   | Required   | Required | Required  | Target database name (RDB name for Db2 for i) |
 | `schema`    | Optional   | -          | -        | Optional  | PostgreSQL schema (search_path) / Db2-for-i library |
 | `protocol`  | -          | -          | Required | -         | Informix connection protocol        |
-| `locale`    | -          | -          | Optional | -         | Informix client locale setting      |
+| `locale`    | -          | -          | Required | -         | Informix client and database locale (see below) |
 
 Use connector `type` = `db2i` for Db2 for IBM i.
+
+Informix uses the same `locale` for `CLIENT_LOCALE` and `DB_LOCALE`; it must
+match the database. Supported codesets in `language_TERRITORY.codeset` are
+`819`/`8859-1` (Latin-1) and `utf8`/`57372` (UTF-8), for example `en_US.819`
+or `en_US.utf8`. The driver must support that locale. Unsupported or empty locale
+values raise `ValueError` when opening a connection; the factory requires the
+`locale` key, as before. Text parameters and character
+results use the matching codec via ODBC SQL_CHAR, including NCHAR/NVARCHAR
+results requested as narrow text. Unrepresentable strings raise encoding errors;
+there is no character replacement or SQL-literal substitution.
+
+Oracle timestamps with precision 0–9 map to `TIMESTAMP`; `WITH TIME ZONE`
+and `WITH LOCAL TIME ZONE` map to `TIMESTAMPTZ`. These are base declarations,
+so the source precision constraint is not reproduced. PostgreSQL and Python
+datetime support at most six fractional digits; Oracle digits beyond that
+are not preserved. Mapping a timezone column does not guarantee preservation
+of its original zone name or session-dependent local-time semantics.
+
+Existing datamart columns created as `TEXT` remain unchanged after upgrading:
+core refresh retains existing table structures. Arrange a separately reviewed
+migration or rebuild after checking existing values and timezone assumptions.
+See [verification and adoption notes](docs/CONNECTOR-FIXES-20261102.md).
 
 ---
 

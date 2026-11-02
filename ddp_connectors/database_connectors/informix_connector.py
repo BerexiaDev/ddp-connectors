@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
 from typing import Any, List, Dict, Optional
+import re
 import pyodbc
 from loguru import logger
 from pyodbc import Cursor
@@ -32,6 +33,19 @@ class InformixConnector(SqlConnector):
         return self._connect_with_retry()
 
     def _open_connection(self):
+        # This connector uses one locale for both client and database. Do not
+        # guess a codec from the host OS or silently substitute UTF-8/Latin-1.
+        locale = re.fullmatch(
+            r"[a-z]{2}_[a-z]{2}\.(819|8859-1|utf8|57372)",
+            self.locale if isinstance(self.locale, str) else "",
+            re.IGNORECASE | re.ASCII,
+        )
+        if locale is None:
+            raise ValueError(
+                "Unsupported Informix locale: expected language_TERRITORY."
+                "codeset with codeset 819, 8859-1, utf8 or 57372"
+            )
+        encoding = "latin1" if locale.group(1).lower() in ("819", "8859-1") else "utf-8"
         conn_str = (
             f"DRIVER={self.driver_path};"
             f"DATABASE={self.database};"
@@ -46,8 +60,12 @@ class InformixConnector(SqlConnector):
         )
         conn = pyodbc.connect(conn_str, timeout=10)
         try:
-            conn.setdecoding(pyodbc.SQL_CHAR, encoding='latin1')
-            conn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')
+            # DataDirect accepts narrow text binds. Request narrow retrieval
+            # for both CHAR and NCHAR families, using the same client codeset.
+            # pyodbc's strict codec handling rejects unrepresentable strings.
+            conn.setencoding(encoding=encoding, ctype=pyodbc.SQL_CHAR)
+            conn.setdecoding(pyodbc.SQL_CHAR, encoding=encoding, ctype=pyodbc.SQL_CHAR)
+            conn.setdecoding(pyodbc.SQL_WCHAR, encoding=encoding, ctype=pyodbc.SQL_CHAR)
         except BaseException:
             self._safe_close(conn)
             raise

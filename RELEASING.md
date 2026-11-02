@@ -1,7 +1,9 @@
 # Release procedure
 
-The proposed release is **ddp-connectors 0.2.1**. Existing version tags must remain
-unchanged. The import namespace remains `ddp_connectors`; Python package indexes
+The Oracle/Informix fixes in **ddp-connectors 0.2.2** are documented in
+[the verification and adoption record](docs/CONNECTOR-FIXES-20261102.md).
+Existing version tags must remain unchanged. The import namespace remains
+`ddp_connectors`; Python package indexes
 normalize underscores and hyphens to the same distribution name.
 
 1. Review the KAN-5 matrix in [docs/KAN-5.md](docs/KAN-5.md) and the changelog.
@@ -12,17 +14,26 @@ normalize underscores and hyphens to the same distribution name.
 4. Build clean artifacts with `python -m build`, then run
    `python -m twine check --strict dist/*`. Keep wheel/sdist hashes and smoke logs
    with the release record.
-5. Release ddp-connectors 0.2.1 independently. It does not require a ddp-lib release,
+5. Release ddp-connectors 0.2.2 independently. It does not require a ddp-lib release,
    source checkout or package installation.
-6. Tag the reviewed commit `0.2.1` and publish artifacts through the team's
-   existing package release channel. Do not move earlier tags or publish donor
-   packages. No publication is automated by this change.
+6. Verify `0.2.2` is absent both locally (`git tag --list 0.2.2`) and remotely
+   (`git ls-remote --tags origin refs/tags/0.2.2 'refs/tags/0.2.2^{}'`). Commit
+   the reviewed release files and push the current branch to origin. Create
+   the annotated tag with `git tag -a 0.2.2 -m "Release ddp-connectors 0.2.2"`
+   and push it with `git push origin refs/tags/0.2.2`. Never force-push or replace
+   an existing tag. Confirm the remote peeled tag `refs/tags/0.2.2^{}` equals
+   the release commit SHA. Core installs from Git, so this tag is the release
+   delivery mechanism; uploading to a package index is a separate action.
 7. KAN-8 updates consumer pins and runs service integration tests. Validate actual
    database drivers/services there; isolated import tests do not establish live
    database connectivity.
 
 CI runs wheel/sdist smoke checks on Python 3.10, 3.11 and 3.12; the consumer
 constraint profile is tested on 3.10, matching existing service images.
+For checks that must leave existing database data untouched, point
+`DDP_TEST_POSTGRES_DSN` at a disposable PostgreSQL instance and leave Oracle
+and Informix live-test settings unset. The original real-driver results and
+their limitations are recorded in the verification document.
 
 CI checks out only this repository using GitHub's built-in token with
 `contents: read`. No additional secret, sibling checkout or dependency

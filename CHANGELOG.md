@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 — 2026-11-02
+
+- Recognize Oracle TIMESTAMP precision 0–9, including both timezone variants,
+  using the existing PostgreSQL TIMESTAMP/TIMESTAMPTZ declarations. Precision
+  beyond microseconds is not preserved; existing TEXT columns require migration.
+- Bind Informix text through SQL_CHAR using the configured locale: Latin-1
+  (`819`, `8859-1`) or UTF-8 (`utf8`, `57372`). Decode character columns using
+  the same codec; reject unsupported locales and unrepresentable text explicitly.
+- Add unit and optional real-driver regressions for schema discovery, PostgreSQL
+  DDL, fractional timestamps, and Latin-1/UTF-8 parameter round trips.
+
 ## 0.2.1
 
 - Add bounded connection retries with configurable backoff across database
