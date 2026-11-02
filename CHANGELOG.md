@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 — 2026-11-02
 
 - Integrate the Informix connection-test query and readable ping errors with
   the shared retry/cleanup behavior, including Oracle missing-schema errors.
