@@ -1,7 +1,15 @@
+import json
 import re
 from typing import Dict
 
 import sqlalchemy
+
+
+def serialize_if_needed(value):
+    """JSON-encode dict/list values while preserving other Oracle bind values."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return value
 
 
 def safe_convert_to_string(value):
@@ -732,11 +740,24 @@ def cast_sqlserver_to_postgresql_type(sql_server_type: str) -> str:
 def cast_oracle_to_postgresql_type(oracle_type: str) -> str:
     """
     Map Oracle type to Postgres type.
+
+    Oracle TIMESTAMP precision 0..9 maps to the existing base TIMESTAMP or
+    TIMESTAMPTZ contract. PostgreSQL/Python retain at most microseconds (6
+    digits); this mapping does not preserve Oracle's sub-microsecond precision.
     :param oracle_type: The Oracle data type as a string
     :return: The corresponding PostgreSQL data type
     """
     # Normalize the input to lowercase to ensure matching works regardless of input casing
     oracle_type_normalized = " ".join(oracle_type.lower().strip().split())
+
+    # Only strip precision from legitimate Oracle timestamp declarations.
+    # Other parameterized/unknown types retain the existing TEXT fallback.
+    timestamp = re.fullmatch(
+        r"timestamp(?:\s*\(\s*[0-9]\s*\))?( with (?:local )?time zone)?",
+        oracle_type_normalized,
+    )
+    if timestamp:
+        return "TIMESTAMPTZ" if timestamp.group(1) else "TIMESTAMP"
 
     oracle_to_pg: Dict[str, str] = {
         "number": "NUMERIC",

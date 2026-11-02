@@ -6,7 +6,10 @@ A unified Python database abstraction layer that provides a consistent interface
 
 ## What This Library Does
 
-CMR Connectors Library sits between your application and your databases, offering a single API to interact with **PostgreSQL**, **SQL Server**, and **IBM Informix**. Instead of writing database-specific logic for each system, you use one factory to create connectors and one set of methods to work with any supported database.
+DeepKube Connectors provides factory entries for **PostgreSQL**, **SQL Server**,
+**IBM Informix**, **Oracle**, **MySQL**, **MongoDB**, **Db2 for IBM i**, and
+read-only **SFTP**. Database capabilities vary by engine; SFTP uses the separate
+file contract documented below.
 
 The library is designed around these core goals:
 
@@ -22,11 +25,15 @@ The library is designed around these core goals:
 
 ### Factory Pattern
 
-The library uses a factory to instantiate the right connector based on the database type. You pass a type identifier (`postgres`, `sqlserver`, or `informix`) along with connection settings, and the factory returns a ready-to-use connector.
+Use `ConnectorFactory().create_connector(type, settings)` with one of
+`postgres`, `sqlserver`, `informix`, `oracle`, `mysql`, `mongo`, `db2i`,
+or `sftp`. Existing settings, constructor arguments and return types are preserved.
 
 ### Abstract Base Class
 
-All connectors inherit from a shared abstract class (`SqlConnector`) that defines the contract every connector must fulfill. This guarantees that regardless of the underlying database, the same set of operations is available.
+Database connectors share the `SqlConnector` interface. Consult each engine's
+implementation for supported operations. SFTP implements `FileConnector` and
+does not expose SQL methods.
 
 ### Database-Specific Implementations
 
@@ -60,7 +67,7 @@ Each connector handles the dialect differences internally — pagination syntax,
 - **Driver:** pyodbc with Informix-specific driver path
 - **Pagination:** `SKIP...FIRST` syntax
 - **Locale Support:** Configurable CLIENT_LOCALE and DB_LOCALE
-- **Encoding:** Handles Latin-1 (ISO-8859-1) for SQL_CHAR and UTF-8 for SQL_WCHAR
+- **Encoding:** Uses the configured Latin-1 or UTF-8 locale for text binding and character results, with strict encoding errors
 - **Type Mapping:** Translates Informix integer-based column type codes to both TypeScript and PostgreSQL types
 
 ### Db2 for IBM i
@@ -86,9 +93,9 @@ from ddp_connectors.connectors_factory import ConnectorFactory
 connector = ConnectorFactory().create_connector("sftp", {
     "host": "sftp.example.org",
     "port": 22,
-    "user": "acaps-reader",
+    "user": "data-reader",
     "password": "obtained-from-a-secret-store",
-    "remote_root": "/exports/acaps",
+    "remote_root": "/exports/data",
     "known_hosts": "/run/secrets/sftp_known_hosts",
     "connect_timeout": 10,
     "auth_timeout": 10,
@@ -165,9 +172,31 @@ Each connector requires a settings dictionary with connection parameters:
 | `database`  | Required   | Required   | Required | Required  | Target database name (RDB name for Db2 for i) |
 | `schema`    | Optional   | -          | -        | Optional  | PostgreSQL schema (search_path) / Db2-for-i library |
 | `protocol`  | -          | -          | Required | -         | Informix connection protocol        |
-| `locale`    | -          | -          | Optional | -         | Informix client locale setting      |
+| `locale`    | -          | -          | Required | -         | Informix client and database locale (see below) |
 
 Use connector `type` = `db2i` for Db2 for IBM i.
+
+Informix uses the same `locale` for `CLIENT_LOCALE` and `DB_LOCALE`; it must
+match the database. Supported codesets in `language_TERRITORY.codeset` are
+`819`/`8859-1` (Latin-1) and `utf8`/`57372` (UTF-8), for example `en_US.819`
+or `en_US.utf8`. The driver must support that locale. Unsupported or empty locale
+values raise `ValueError` when opening a connection; the factory requires the
+`locale` key, as before. Text parameters and character
+results use the matching codec via ODBC SQL_CHAR, including NCHAR/NVARCHAR
+results requested as narrow text. Unrepresentable strings raise encoding errors;
+there is no character replacement or SQL-literal substitution.
+
+Oracle timestamps with precision 0–9 map to `TIMESTAMP`; `WITH TIME ZONE`
+and `WITH LOCAL TIME ZONE` map to `TIMESTAMPTZ`. These are base declarations,
+so the source precision constraint is not reproduced. PostgreSQL and Python
+datetime support at most six fractional digits; Oracle digits beyond that
+are not preserved. Mapping a timezone column does not guarantee preservation
+of its original zone name or session-dependent local-time semantics.
+
+Existing datamart columns created as `TEXT` remain unchanged after upgrading:
+core refresh retains existing table structures. Arrange a separately reviewed
+migration or rebuild after checking existing values and timezone assumptions.
+See [verification and adoption notes](docs/CONNECTOR-FIXES-20261102.md).
 
 ---
 
@@ -195,28 +224,51 @@ ddp_connectors/
 | Package      | Purpose                                      |
 |-------------|----------------------------------------------|
 | `pyodbc`    | SQL Server and Informix connections           |
-| `psycopg2`  | PostgreSQL database connections               |
+| `psycopg2-binary` | PostgreSQL connections (the `psycopg2` import) |
 | `jaydebeapi` | Db2 for IBM i connections (JDBC via JTOpen)  |
 | `JPype1`    | JVM bridge used by `jaydebeapi`               |
 | `sqlalchemy` | SQL type mapping and handling                |
-| `cx_oracle`  | Oracle database connections (reserved)       |
+| `oracledb` | Oracle database connections |
 | `loguru`     | Structured logging                           |
+| `mysql-connector-python` | MySQL connections |
+| `pymongo<4` | MongoDB, compatible with current consumers' driver pins |
+| `pandas`, `numpy<2` | Type inference and batch data conversion |
+| `paramiko` | Read-only SFTP |
 
 > Db2 for IBM i also needs `jt400.jar` (the JTOpen driver) on disk and a JVM available. The service Dockerfiles set `JT400_JAR` to its vendored location under `app/main/drivers/`.
 
 ---
 
-## Publishing to PyPI
+## Compatibility and release checks
 
-1. Install build tools: `pip install wheel twine`
-2. Build the distribution: `python setup.py sdist bdist_wheel`
-3. Upload to PyPI: `twine upload dist/*`
+PostgreSQL ordinary and partitioned table builders accept the keyword-only
+`include_defaults=True` option. It copies validated literals (including common
+built-in PostgreSQL casts); functions, custom casts and source-dialect SQL are
+omitted. Calls without the option preserve the existing default-free SQL.
+Partitioned parents receive exactly one primary key from their explicit key and
+partition column. Exact identifier spelling, including embedded quotes, is retained.
+
+```sh
+python -m pip install build twine
+python scripts/smoke_install.py
+python scripts/smoke_install.py --constraints tests/consumer-constraints.txt
+```
+
+The package builds and installs independently of ddp-lib. Oracle's
+`serialize_if_needed` lives in `database_connectors/sql_connector_utils.py`
+and preserves the existing JSON encoding and scalar return behavior.
+
+Each command builds release artifacts, installs wheel and sdist separately into
+fresh environments, runs `pip check` and all contract/import tests, and verifies
+that ddp-lib is absent. The constraint profile matches Python 3.10
+consumers. See [audit](docs/KAN-5.md), [changes](CHANGELOG.md) and
+[release procedure](RELEASING.md).
 
 ---
 
 ## Requirements
 
-- Python >= 3.6
+- Python >= 3.10 (matching canonical syntax and existing consumer images)
 - Appropriate database drivers installed on the host system (ODBC Driver 17 for SQL Server, Informix ODBC driver for Informix)
 
 ---

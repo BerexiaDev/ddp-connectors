@@ -1,0 +1,4 @@
+recursive-include tests *.py *.txt
+recursive-include scripts *.py
+recursive-include docs *.md
+include CHANGELOG.md RELEASING.md
