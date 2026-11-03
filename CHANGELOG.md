@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3.1 — 2026-11-03
+
+- Redact credentials from shared database failure logs, including quoted ODBC
+  values, connection URIs and escaped DB-API error tuples.
+- Preserve driver messages, reported SQLSTATEs, ODBC operations and traceback
+  frame locations in structured `connector_error` events, without exception
+  locals. Expose sanitized `last_error_details` alongside readable ping errors.
+- Apply consistent ping error state to SQL, Oracle, Db2 for i and MongoDB, and
+  clear both error fields before each ping. Preserve retry and transaction behavior.
+- Replace PostgreSQL exception-local and session-row dumps with safe diagnostics.
+- Add regressions for masking edge cases, driver details, cleanup and unchanged
+  retry budgets. Consumer package pins and deployments are separate changes.
+
 ## 0.2.3 — 2026-11-02
 
 - Integrate the Informix connection-test query and readable ping errors with

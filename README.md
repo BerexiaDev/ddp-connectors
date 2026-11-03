@@ -120,6 +120,34 @@ Configuration: `host`, `user`, and absolute `remote_root` are required; `port` d
 
 ## Core Capabilities
 
+### Database error diagnostics
+
+Database `ping()` still returns a boolean. After a failed ping, `last_error`
+contains a credential-redacted, readable message and `last_error_details`
+contains a JSON-compatible diagnostic record. Both reset at the start of the
+next ping. Informix's readable guidance does not replace the original driver
+message in the diagnostic record.
+
+The library emits `connector_error {json}` for failed database pings, terminal
+owned SQL reads, and existing database exception-log sites. Records include the
+operation, connector type and target, original driver text with credentials
+redacted, reported SQLSTATE and ODBC operation when available, and traceback
+frame locations without source lines or local variables. No SQL statements,
+parameters or result rows are added to these records. PostgreSQL's session
+debug snapshots log counts rather than session users and row samples.
+
+Known configured credentials, credential assignments and URI authentication are
+redacted before logging. Error-formatting failures omit driver details rather
+than changing the operation's outcome. Retry budgets, queries and transaction
+handling are unchanged. Re-raised driver exceptions retain their original
+identity and content; callers remain responsible for sanitizing their own logs
+and HTTP responses. This does not configure third-party driver tracing or the
+application's global Loguru sinks.
+
+These diagnostics are included in release `0.2.3.1`. Existing pinned consumers
+receive them when API and Sync adopt that release. See the
+[release record](docs/RELEASE-0.2.3.1.md) for validation and adoption details.
+
 ### Data Extraction
 
 - **Batch Pagination** — Fetch rows in configurable page sizes with offset-based pagination, each database using its native syntax

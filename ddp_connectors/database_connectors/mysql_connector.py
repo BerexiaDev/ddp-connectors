@@ -6,6 +6,7 @@ import mysql.connector
 from datetime import datetime
 
 from loguru import logger
+from ..diagnostics import log_failure
 from typing import Dict, Any, List, Optional, Tuple
 
 from .sql_connector import SqlConnector
@@ -187,7 +188,7 @@ class MySQLConnector(SqlConnector):
                         logger.error("Filters must be a JSON array; ignoring filters.")
                         parsed_filters = []
                 except json.JSONDecodeError as exc:
-                    logger.error(f"Invalid filters JSON provided; ignoring filters. {exc}")
+                    log_failure(self, "_build_filters_clause", exc)
             else:
                 logger.warning("Empty filters string provided; ignoring filters.")
         elif isinstance(filters, list):
@@ -520,7 +521,7 @@ class MySQLConnector(SqlConnector):
             logger.info(f"Successfully truncated table: {qualified_table}")
             return True
         except Exception as e:
-            logger.error(f"Failed to truncate table {table_name}: {str(e)}")
+            log_failure(self, "truncate_table", e, schema=schema, table_name=table_name)
             if conn:
                 conn.rollback()
             return False

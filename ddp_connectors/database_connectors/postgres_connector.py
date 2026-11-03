@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from pyodbc import Cursor
 
 from .sql_connector import SqlConnector
+from ..diagnostics import log_failure
 from .connection_errors import postgres_connection_error
 from ddp_connectors.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
     _build_having_clause
@@ -79,34 +80,7 @@ class PostgresConnector(SqlConnector):
         schema: Optional[str] = None,
         table: Optional[str] = None,
     ) -> None:
-        details = [
-            f"[postgres][{operation}]",
-            f"database={self.database}",
-            f"user={self.user}",
-            f"query_path={query_path}",
-        ]
-
-        if schema:
-            details.append(f"selected_schema={schema}")
-        if table:
-            details.append(f"selected_table={table}")
-
-        pgcode = getattr(exc, "pgcode", None)
-        if pgcode:
-            details.append(f"pgcode={pgcode}")
-
-        diag = getattr(exc, "diag", None)
-        primary_message = getattr(diag, "message_primary", None) if diag else None
-        if primary_message:
-            details.append(f"pg_message={primary_message}")
-
-        logger.exception(" ".join(details))
-
-    def _format_debug_rows(self, rows: List[Tuple[Any, ...]], limit: int = 10) -> List[Tuple[Any, ...]]:
-        formatted_rows: List[Tuple[Any, ...]] = []
-        for row in rows[:limit]:
-            formatted_rows.append(tuple(safe_convert_to_string(value) for value in row))
-        return formatted_rows
+        log_failure(self, operation, exc, query_path=query_path, schema=schema, table=table)
 
     def _log_debug_query(
         self,
@@ -120,14 +94,11 @@ class PostgresConnector(SqlConnector):
             cur.execute(query, params)
             rows = cur.fetchall()
             logger.info(
-                f"[postgres][discovery_debug] database={self.database} user={self.user} label={label} "
-                f"returned_count={len(rows)} sample={self._format_debug_rows(rows, sample_limit)}"
+                f"[postgres][discovery_debug] database={self.database} label={label} "
+                f"returned_count={len(rows)}"
             )
         except Exception as debug_exc:
-            logger.warning(
-                f"[postgres][discovery_debug] database={self.database} user={self.user} label={label} "
-                f"failed: {debug_exc}"
-            )
+            log_failure(self, "_log_debug_query", debug_exc, label=label)
             raise
 
     def _log_schema_discovery_debug_snapshot(self, cur) -> None:
@@ -381,7 +352,7 @@ class PostgresConnector(SqlConnector):
                         logger.error("Filters must be a JSON array; ignoring filters.")
                         parsed_filters = []
                 except json.JSONDecodeError as exc:
-                    logger.error(f"Invalid filters JSON provided; ignoring filters. {exc}")
+                    log_failure(self, "_build_filters_clause", exc)
             else:
                 logger.warning("Empty filters string provided; ignoring filters.")
         elif isinstance(filters, list):
@@ -743,7 +714,7 @@ class PostgresConnector(SqlConnector):
             conn.commit()
             logger.info(f"Schema {schema_name} created or already exists.")
         except Exception as e:
-            logger.error(f"Failed to create schema {schema_name}: {e}")
+            log_failure(self, "create_schema_if_missing", e, schema_name=schema_name)
             conn.rollback()
         finally:
             cursor.close()
@@ -761,7 +732,7 @@ class PostgresConnector(SqlConnector):
             conn.commit()
             logger.info(f"Table {table_name} created or already exists.")
         except Exception as e:
-            logger.error(f"Failed to create table {table_name}: {e}")
+            log_failure(self, "create_table_if_missing", e, table_name=table_name)
             conn.rollback()
         finally:
             cursor.close()
@@ -941,7 +912,7 @@ class PostgresConnector(SqlConnector):
             )
             return missing_columns
         except Exception as e:
-            logger.error(f"Failed reconciling columns on {target_schema}.{pure_table}: {e}")
+            log_failure(self, "ensure_columns_exist", e, schema=schema, table_name=table_name)
             conn.rollback()
             raise
         finally:
@@ -1028,7 +999,7 @@ class PostgresConnector(SqlConnector):
             logger.info(f"Ensured DEFAULT partition: {schema_name}.{default_table}")
         except Exception as e:
             conn.rollback()
-            logger.error(f"Failed creating DEFAULT partition for {schema_name}.{parent_table}: {e}")
+            log_failure(self, "create_default_partition", e, schema_name=schema_name)
             raise
         finally:
             cur.close()
@@ -1091,7 +1062,7 @@ class PostgresConnector(SqlConnector):
             )
         except Exception as e:
             conn.rollback()
-            logger.error(f"Failed creating partitions for {schema_name}.{parent_table}: {e}")
+            log_failure(self, "create_range_partitions_year_month", e, schema_name=schema_name)
             raise
         finally:
             cur.close()
@@ -1292,7 +1263,7 @@ class PostgresConnector(SqlConnector):
             return query
 
         except Exception as e:
-            logger.error(f"Error building query: {str(e)}")
+            log_failure(self, "build_query", e)
             return None
         
         
@@ -1314,7 +1285,7 @@ class PostgresConnector(SqlConnector):
             return True
             
         except Exception as e:
-            logger.error(f"Failed to truncate table {self.qualify_table_name(table_name, schema)}: {str(e)}")
+            log_failure(self, "truncate_table", e, schema=schema, table_name=table_name)
             if conn:
                 conn.rollback()
             return False
@@ -1367,7 +1338,7 @@ class PostgresConnector(SqlConnector):
             conn.commit()
 
         except Exception as e:
-            logger.error(f"Error managing indexes on {use_schema}.{table_name}: {e}")
+            log_failure(self, "manage_table_indexes", e, schema=schema, table_name=table_name)
             if conn:
                 conn.rollback()
 
@@ -1450,7 +1421,7 @@ class PostgresConnector(SqlConnector):
             return {"status": "success", "message": message}, 200
 
         except Exception as e:
-            logger.error(f"Error managing primary keys on {use_schema}.{table_name}: {e}")
+            log_failure(self, "manage_table_primary_keys", e, schema=schema, table_name=table_name)
             if conn:
                 conn.rollback()
             return {"status": "error", "message": "Failed to create data mart connector"}, 500
@@ -1475,7 +1446,7 @@ class PostgresConnector(SqlConnector):
             conn.commit()
             logger.info(f"ANALYZE completed for {schema}.{table}")
         except Exception as e:
-            logger.error(f"Failed to ANALYZE {schema}.{table}: {e}")
+            log_failure(self, "analyze_table", e, schema=schema)
             if conn:
                 conn.rollback()
             # don't raise: ANALYZE failure shouldn't break sync completion
@@ -1558,7 +1529,7 @@ class PostgresConnector(SqlConnector):
             )
 
         except Exception as e:
-            logger.error(f"Failed creating indexes on {schema}.{table} from defs: {e}")
+            log_failure(self, "create_indexes_from_defs", e, schema=schema)
             if conn:
                 conn.rollback()
             raise  # here I *would* raise, because index creation is part of your feature test
@@ -1608,7 +1579,7 @@ class PostgresConnector(SqlConnector):
             return dropped
 
         except Exception as e:
-            logger.error(f"Failed dropping secondary indexes on {schema}.{table}: {e}")
+            log_failure(self, "drop_secondary_indexes", e, schema=schema)
             if conn:
                 conn.rollback()
             raise

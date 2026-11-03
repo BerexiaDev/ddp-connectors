@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from .sql_connector import SqlConnector
+from ..diagnostics import log_failure, record_ping_failure
 from .connection_errors import jdbc_connection_error
 from .sql_connector_utils import (
     safe_convert_to_string,
@@ -116,6 +117,8 @@ class Db2iConnector(SqlConnector):
         )
 
     def ping(self):
+        self.last_error = None
+        self.last_error_details = None
         def _ping(cursor):
             cursor.execute("SELECT 1 FROM SYSIBM.SYSDUMMY1")
             cursor.fetchone()
@@ -124,7 +127,7 @@ class Db2iConnector(SqlConnector):
         try:
             return self._run_read_with_retry("ping", _ping)
         except Exception as error:
-            logger.error(f"Database connection failed: {error}")
+            record_ping_failure(self, error)
             return False
 
     def extract_data_batch(self, table_name: str, offset: int = 0, limit: int = 100) -> List[dict]:
@@ -382,7 +385,7 @@ class Db2iConnector(SqlConnector):
             conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Error truncating table {table_name}: {e}")
+            log_failure(self, "truncate_table", e, table_name=table_name)
             conn.rollback()
             return False
         finally:

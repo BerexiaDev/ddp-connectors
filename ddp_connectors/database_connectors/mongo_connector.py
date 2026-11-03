@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Tuple
 from pymongo import MongoClient
 from pymongo.errors import AutoReconnect, ConnectionFailure
 from ..retry import RetryPolicy
+from ..diagnostics import log_failure, record_ping_failure
 
 from bson import ObjectId
 from bson.decimal128 import Decimal128
@@ -78,6 +79,8 @@ class MongoConnector(RetryPolicy):
         self.port = port
         self.database_name = database
         self.driver = "mongodb"
+        self.last_error = None
+        self.last_error_details = None
         # Caches the inferred relational schema per collection so that
         # extract_table_schema() (used to build the table DDL + INSERT columns) and
         # stream_batch()/fetch_batch() (which must yield rows in the SAME column order)
@@ -91,12 +94,14 @@ class MongoConnector(RetryPolicy):
         )
 
     def ping(self) -> bool:
+        self.last_error = None
+        self.last_error_details = None
         client = None
         try:
             client = self.get_connection()
             return True
         except Exception as error:
-            logger.error(f"MongoDB connection ping failed: {error}")
+            record_ping_failure(self, error)
             return False
         finally:
             self._safe_close(client)
@@ -148,7 +153,7 @@ class MongoConnector(RetryPolicy):
             return total_inserted
             
         except Exception as exc:
-            logger.error(f"Error inserting data into {table_name}: {exc}")
+            log_failure(self, "insert_data", exc, table_name=table_name)
             raise
             
         finally:

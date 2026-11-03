@@ -4,6 +4,7 @@ from datetime import datetime
 from loguru import logger
 from typing import Dict, Any, List, Optional
 from .sql_connector import SqlConnector
+from ..diagnostics import log_failure, record_ping_failure
 from .sql_connector_utils import (
     cast_oracle_to_postgresql_type, cast_oracle_to_typescript,
     normalize_ui_column_type, safe_convert_to_string, serialize_if_needed,
@@ -25,6 +26,7 @@ class OracleConnector(SqlConnector):
     
     def ping(self):
         self.last_error = None
+        self.last_error_details = None
         def _ping(cursor):
             cursor.execute("SELECT 1 FROM DUAL")
             cursor.execute("SELECT count(*) FROM all_users WHERE username = :schema_name", schema_name=self.schema)
@@ -33,11 +35,10 @@ class OracleConnector(SqlConnector):
         try:
             found = self._run_read_with_retry("ping", _ping)
             if not found:
-                self.last_error = f"Schema '{self.schema}' does not exist, or this user cannot see it."
+                record_ping_failure(self, ValueError(f"Schema '{self.schema}' does not exist, or this user cannot see it."))
             return found
         except Exception as error:
-            logger.error(f"Database connection failed: {error}")
-            self.last_error = self.describe_error(error)
+            record_ping_failure(self, error)
             return False
     
     def get_connection(self):
@@ -166,7 +167,7 @@ class OracleConnector(SqlConnector):
                 
         except Exception as exc:
             conn.rollback()
-            logger.error(f"Error inserting data into {table_name}: {exc}")
+            log_failure(self, "insert_data", exc, table_name=table_name)
             raise
             
         finally:
@@ -375,7 +376,7 @@ class OracleConnector(SqlConnector):
                 conn.commit()
                 logger.info(f"Schema/User {schema_name} verified/created.")
         except Exception as e:
-            logger.error(f"Failed to create schema {schema_name}: {e}")
+            log_failure(self, "create_schema_if_missing", e, schema_name=schema_name)
             conn.rollback()
         finally:
             conn.close()
@@ -458,7 +459,7 @@ class OracleConnector(SqlConnector):
                 return True
         except Exception as exc:
             conn.rollback()
-            logger.error(f"Failed to truncate table {qualified_table}: {exc}")
+            log_failure(self, "truncate_table", exc, schema=schema, table_name=table_name)
             return False
         finally:
             conn.close()

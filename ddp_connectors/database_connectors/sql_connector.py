@@ -10,6 +10,7 @@ import pyodbc
 from pyodbc import Cursor
 from loguru import logger
 from ..retry import RetryPolicy
+from ..diagnostics import log_failure, record_ping_failure
 
 
 def _sqlstates(error):
@@ -93,6 +94,7 @@ class SqlConnector(RetryPolicy):
         self.database = database
         self.driver = None
         self.last_error = None
+        self.last_error_details = None
 
     
     @abstractmethod
@@ -123,6 +125,9 @@ class SqlConnector(RetryPolicy):
                 return operation(active_cursor)
             except Exception as error:
                 if attempt >= self.max_connection_retries or not self._is_retryable_connection_error(error, connecting=connection is None):
+                    if operation_name != 'ping':
+                        log_failure(self, operation_name, error, attempt=attempt + 1,
+                                    phase='connect' if connection is None else 'query')
                     raise
             finally:
                 self._safe_close(active_cursor)
@@ -147,6 +152,8 @@ class SqlConnector(RetryPolicy):
                 return
             except Exception as error:
                 if emitted or attempt >= self.max_connection_retries or not self._is_retryable_connection_error(error, connecting=connection is None):
+                    log_failure(self, operation_name, error, attempt=attempt + 1,
+                                phase='connect' if connection is None else 'query', rows_emitted=emitted)
                     raise
             finally:
                 self._safe_close(iterator)
@@ -158,6 +165,7 @@ class SqlConnector(RetryPolicy):
     def ping(self):
         """Returns True if the connection is successful, False otherwise."""
         self.last_error = None
+        self.last_error_details = None
         def _ping(cursor):
             cursor.execute(self.PING_QUERY)
             cursor.fetchone()
@@ -165,8 +173,7 @@ class SqlConnector(RetryPolicy):
         try:
             self._run_read_with_retry("ping", _ping)
         except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            self.last_error = self.describe_error(e)
+            record_ping_failure(self, e)
             return False
 
         logger.info("Database connection is active.")
