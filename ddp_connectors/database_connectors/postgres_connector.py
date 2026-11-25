@@ -10,6 +10,7 @@ from pyodbc import Cursor
 
 from .sql_connector import SqlConnector
 from ..diagnostics import log_failure
+from ..connection_labels import normalize_application_name
 from .connection_errors import postgres_connection_error
 from ddp_connectors.database_connectors.utils.postgres_connector_utils import _build_select_clause, _build_joins_clause, _build_where_clause, _build_group_by, \
     _build_having_clause
@@ -22,10 +23,11 @@ class PostgresConnector(SqlConnector):
     supports_owned_read_cursor = True
     _is_retryable_connection_error = staticmethod(postgres_connection_error)
 
-    def __init__(self, host, user, password, port, database, schema):
+    def __init__(self, host, user, password, port, database, schema, *, application_name="ddp:source"):
         super().__init__(host, user, password, port, database)
         self.driver = "postgresql+psycopg2"
         self.schema = schema
+        self.application_name = normalize_application_name(application_name)
 
     def _build_search_path(self) -> str:
         search_path_parts: List[str] = []
@@ -50,6 +52,7 @@ class PostgresConnector(SqlConnector):
             "port": self.port,
             "dbname": self.database,
             "connect_timeout": 10,
+            "application_name": self.application_name,
         }
 
         search_path = self._build_search_path()
