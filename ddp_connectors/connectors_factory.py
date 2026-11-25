@@ -1,11 +1,12 @@
 from ddp_connectors.retry import RetryPolicy
+from ddp_connectors.connection_labels import normalize_application_name
 
 
 class ConnectorFactory():
-    """Helper class that provides a standard way to create a Data Checker using factory method"""
+    """Create canonical connectors with an optional PostgreSQL session label."""
     
-    def __init__(self):
-        pass
+    def __init__(self, application_name="ddp:source", *, default_application_name="ddp:source"):
+        self.application_name = normalize_application_name(application_name, default_application_name)
     
     def create_connector(self, connector_type, connector_settings):
         connector = self._create_connector(connector_type, connector_settings)
@@ -33,7 +34,8 @@ class ConnectorFactory():
             from ddp_connectors.database_connectors.postgres_connector import PostgresConnector
             connector = PostgresConnector(connector_settings["host"], connector_settings["user"],
                                           connector_settings["password"], connector_settings["port"],
-                                          connector_settings["database"], connector_settings.get("schema", 'public'))
+                                          connector_settings["database"], connector_settings.get("schema", 'public'),
+                                          application_name=self.application_name)
             return connector
 
         elif connector_type == 'informix':

@@ -29,6 +29,30 @@ Use `ConnectorFactory().create_connector(type, settings)` with one of
 `postgres`, `sqlserver`, `informix`, `oracle`, `mysql`, `mongo`, `db2i`,
 or `sftp`. Existing settings, constructor arguments and return types are preserved.
 
+### PostgreSQL session labels (0.2.4)
+
+```python
+factory = ConnectorFactory(application_name="ddp-api:source_read")
+connector = factory.create_connector("postgres", settings)
+# All physical connections, including retry/metadata helpers, use this label.
+connection = connector.get_connection()
+```
+
+The optional label is held on each connector, trimmed, converted to printable
+ASCII (other characters become `_`), and truncated to 63 bytes. Empty values
+fall back to `ddp:source`; a service can pass
+`default_application_name="ddp-api:source"` to the factory. Direct PostgreSQL
+construction also accepts keyword-only `application_name`. Other engines keep
+their existing factory calls and arguments.
+
+Use operation names and opaque internal IDs only, never credentials, SQL or
+personal data. Startup tagging requires no cursor/commit and survives rollback.
+Canonical retries, search paths and libpq SSL environment settings are retained.
+There is no PostgreSQL connection pool in this package. A future pool that shares
+physical sessions across jobs needs checkout/reset semantics before these labels
+can describe individual jobs. Generic labels do not establish cancellation
+ownership.
+
 ### Abstract Base Class
 
 Database connectors share the `SqlConnector` interface. Consult each engine's
