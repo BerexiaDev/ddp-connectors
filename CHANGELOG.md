@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4 — 2026-11-27
+
+- Add per-instance PostgreSQL startup `application_name` to the canonical
+  factory and connector. Normalize to 63 printable ASCII bytes with a neutral
+  `ddp:source` fallback and an optional service fallback at the factory boundary.
+- Cover retry and owned helper connections without issuing SET/COMMIT or
+  replacing canonical connection/search-path, SSL or transaction behavior.
+- Keep non-PostgreSQL constructor arguments and retry contracts unchanged.
+- Add driver, live rollback/helper/SSL, interleaving and non-PostgreSQL regressions.
+
 ## 0.2.3.1 — 2026-11-03
 
 - Redact credentials from shared database failure logs, including quoted ODBC

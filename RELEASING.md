@@ -1,7 +1,8 @@
 # Release procedure
 
-The current release is **ddp-connectors 0.2.3.1** from `main`, including shared
-database logging hardening. See the [0.2.3.1 release record](docs/RELEASE-0.2.3.1.md),
+The current published baseline is **ddp-connectors 0.2.4** from `main`
+(PostgreSQL startup labels, released 2026-11-27).
+See the [changelog](CHANGELOG.md) and the [0.2.3.1 release record](docs/RELEASE-0.2.3.1.md),
 the previous [0.2.3 release record](docs/RELEASE-0.2.3.md),
 [merge decisions](docs/PR-MERGE-20261102.md), and
 [original verification and adoption record](docs/CONNECTOR-FIXES-20261102.md).
@@ -17,17 +18,18 @@ normalize underscores and hyphens to the same distribution name.
 4. Build clean artifacts with `python -m build`, then run
    `python -m twine check --strict dist/*`. Keep wheel/sdist hashes and smoke logs
    with the release record.
-5. Release ddp-connectors 0.2.3.1 independently. It does not require a ddp-lib release,
+5. Release ddp-connectors 0.2.4 independently. It does not require a ddp-lib release,
    source checkout or package installation.
-6. Verify `0.2.3.1` is absent both locally (`git tag --list 0.2.3.1`) and remotely
-   (`git ls-remote --tags origin refs/tags/0.2.3.1 'refs/tags/0.2.3.1^{}'`). Commit
+6. Verify `0.2.4` is absent both locally (`git tag --list 0.2.4`) and remotely
+   (`git ls-remote --tags origin refs/tags/0.2.4 'refs/tags/0.2.4^{}'`). Commit
    the reviewed release files on `main` and push `main` to origin. Create
-   the annotated tag with `git tag -a 0.2.3.1 -m "Release ddp-connectors 0.2.3.1"`
-   and push it with `git push origin refs/tags/0.2.3.1`. Never force-push or replace
-   an existing tag. Confirm the remote peeled tag `refs/tags/0.2.3.1^{}` equals
+   the annotated tag with `git tag -a 0.2.4 -m "Release ddp-connectors 0.2.4"`
+   and push it with `git push origin refs/tags/0.2.4`. Never force-push or replace
+   an existing tag. Confirm the remote peeled tag `refs/tags/0.2.4^{}` equals
    the release commit SHA. Core installs from Git, so this tag is the release
    delivery mechanism; uploading to a package index is a separate action.
-7. KAN-8 updates consumer pins and runs service integration tests. Validate actual
+7. The R03 follow-up under KAN-20 updates API/Sync pins to this candidate
+   and runs service integration tests, retaining the KAN-8 contracts. Validate actual
    database drivers/services there; isolated import tests do not establish live
    database connectivity.
 
