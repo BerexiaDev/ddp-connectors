@@ -1,7 +1,7 @@
 # Release procedure
 
-The current published baseline is **ddp-connectors 0.2.3.1** from `main`.
-The next candidate is **0.2.4** (PostgreSQL startup labels), not yet published.
+The current published baseline is **ddp-connectors 0.2.4** from `main`
+(PostgreSQL startup labels, released 2026-11-27).
 See the [changelog](CHANGELOG.md) and the [0.2.3.1 release record](docs/RELEASE-0.2.3.1.md),
 the previous [0.2.3 release record](docs/RELEASE-0.2.3.md),
 [merge decisions](docs/PR-MERGE-20261102.md), and

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.4 — unreleased
+## 0.2.4 — 2026-11-27
 
 - Add per-instance PostgreSQL startup `application_name` to the canonical
   factory and connector. Normalize to 63 printable ASCII bytes with a neutral
